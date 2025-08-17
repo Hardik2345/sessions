@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import mongoose from 'mongoose';
 import { z } from 'zod';
 import { v4 as uuid } from 'uuid';
+import cors from 'cors';
 
 
 const app = express();
