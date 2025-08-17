@@ -5,9 +5,19 @@ import mongoose from 'mongoose';
 import { z } from 'zod';
 import { v4 as uuid } from 'uuid';
 
+
 const app = express();
 app.use(helmet());
 app.use(express.json({ limit: '256kb' }));
+
+app.use(cors({
+  origin: true, // or specify your domains: ['https://yourstore.com','https://checkout.shopify.com']
+  methods: ['POST', 'GET', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'X-Collector-Key'],
+  maxAge: 86400
+}));
+
+app.options('/collect', cors());
 
 const { MONGO_URI, PORT = 3000, COLLECTOR_KEY } = process.env;
 
