@@ -82,6 +82,7 @@ function parseUTM(u) {
 
 // ---------- Routes ----------
 app.post('/collect', async (req, res) => {
+  console.log("Received event:", req.body);
   try {
     if (!COLLECTOR_KEY || req.get('X-Collector-Key') !== COLLECTOR_KEY) {
       return res.sendStatus(401);
