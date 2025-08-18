@@ -173,6 +173,66 @@ app.get('/metrics/sessions', async (req, res) => {
   }
 });
 
+app.get('/metrics/sessions/:timestamp',async (req,res)=>{
+    try {
+      const { timestamp } = req.params;
+      const eventName = (req.query.eventName || 'add_to_cart').toString();
+
+      // Parse timestamp: accept ISO string, epoch ms, or epoch s
+      let ts;
+      if (/^\d+$/.test(timestamp)) {
+        // numeric epoch; if 10 digits, assume seconds
+        const n = Number(timestamp);
+        const ms = timestamp.length === 10 ? n * 1000 : n;
+        ts = new Date(ms);
+      } else {
+        ts = new Date(timestamp);
+      }
+      if (isNaN(ts.getTime())) {
+        return res.status(400).json({ error: 'invalid timestamp' });
+      }
+
+      // Count sessions started after timestamp
+      const totalSessionsPromise = Session.countDocuments({ started_at: { $gt: ts } });
+
+      // Count distinct sessions that have the specified event AND started after timestamp
+      // Aggregation scans matching events and joins to sessions filtered by started_at > ts
+      const withEventAggPromise = Event.aggregate([
+        { $match: { event_name: eventName } },
+        {
+          $lookup: {
+            from: 'sessions',
+            let: { sid: '$session_id' },
+            pipeline: [
+              {
+                $match: {
+                  $expr: {
+                    $and: [
+                      { $eq: ['$session_id', '$$sid'] },
+                      { $gt: ['$started_at', ts] }
+                    ]
+                  }
+                }
+              }
+            ],
+            as: 'sess'
+          }
+        },
+        { $match: { 'sess.0': { $exists: true } } },
+        { $group: { _id: '$session_id' } },
+        { $count: 'cnt' }
+      ]).exec();
+
+      const [totalSessions, withEventAgg] = await Promise.all([totalSessionsPromise, withEventAggPromise]);
+      const sessionsWithEvent = (withEventAgg && withEventAgg[0] && withEventAgg[0].cnt) || 0;
+
+      return res.json({ from: ts, eventName, totalSessions, sessionsWithEvent });
+    } catch (e) {
+      console.error(e);
+      return res.status(500).json({ error: 'internal' });
+    }
+})
+
 // Health
 app.get('/healthz', (_, res) => res.json({ ok: true }));
 
