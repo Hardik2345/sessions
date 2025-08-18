@@ -195,38 +195,15 @@ app.get('/metrics/sessions/:timestamp',async (req,res)=>{
       // Count sessions started after timestamp
       const totalSessionsPromise = Session.countDocuments({ started_at: { $gt: ts } });
 
-      // Count distinct sessions that have the specified event AND started after timestamp
-      // Aggregation scans matching events and joins to sessions filtered by started_at > ts
-      const withEventAggPromise = Event.aggregate([
-        { $match: { event_name: eventName } },
-        {
-          $lookup: {
-            from: 'sessions',
-            let: { sid: '$session_id' },
-            pipeline: [
-              {
-                $match: {
-                  $expr: {
-                    $and: [
-                      { $eq: ['$session_id', '$$sid'] },
-                      { $gt: ['$started_at', ts] }
-                    ]
-                  }
-                }
-              }
-            ],
-            as: 'sess'
-          }
-        },
-        { $match: { 'sess.0': { $exists: true } } },
-        { $group: { _id: '$session_id' } },
-        { $count: 'cnt' }
-      ]).exec();
+      // Count total events of the given name that occurred after timestamp
+      const totalEventsPromise = Event.countDocuments({
+        event_name: eventName,
+        occurred_at: { $gt: ts }
+      });
 
-      const [totalSessions, withEventAgg] = await Promise.all([totalSessionsPromise, withEventAggPromise]);
-      const sessionsWithEvent = (withEventAgg && withEventAgg[0] && withEventAgg[0].cnt) || 0;
+      const [totalSessions, totalEvents] = await Promise.all([totalSessionsPromise, totalEventsPromise]);
 
-      return res.json({ from: ts, eventName, totalSessions, sessionsWithEvent });
+      return res.json({ from: ts, eventName, totalSessions, totalEvents });
     } catch (e) {
       console.error(e);
       return res.status(500).json({ error: 'internal' });
