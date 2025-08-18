@@ -27,7 +27,7 @@ const sessionSchema = new mongoose.Schema({
   session_id: { type: String, required: true, index: true, unique: true },
   actor_id:   { type: String, required: true, index: true }, // visitor_id (preferred) or client_id
   started_at: { type: Date,   required: true, index: true },
-  last_event_at: { type: Date, required: true, index: true },
+  last_event_at: { type: Date, required: true },
   landing_url: { type: String },
   landing_referrer: { type: String },
   // optional: attribution
@@ -45,7 +45,7 @@ const eventSchema = new mongoose.Schema({
   event_id:   { type: String, required: true, unique: true },
   session_id: { type: String, index: true },
   event_name: { type: String, required: true, index: true },
-  occurred_at:{ type: Date,   required: true, index: true },
+  occurred_at:{ type: Date,   required: true },
   url:        { type: String },
   referrer:   { type: String },
   user_agent: { type: String },
@@ -56,6 +56,12 @@ const eventSchema = new mongoose.Schema({
 
 // Useful compound index for time-series queries per session
 eventSchema.index({ session_id: 1, occurred_at: 1 });
+
+// TTL: expire documents 6 hours (21600s) after their timestamp fields
+// Sessions expire 6h after last activity
+sessionSchema.index({ last_event_at: 1 }, { expireAfterSeconds: 21600 });
+// Events expire 6h after they occurred
+eventSchema.index({ occurred_at: 1 }, { expireAfterSeconds: 21600 });
 
 const Session = mongoose.model('Session', sessionSchema);
 const Event   = mongoose.model('Event', eventSchema);
@@ -219,5 +225,12 @@ app.get('/healthz', (_, res) => res.json({ ok: true }));
     serverSelectionTimeoutMS: 10000,
     maxPoolSize: 10
   });
+  // Ensure TTL and other indexes are in sync with schema. This may drop/recreate indexes if needed.
+  try {
+    await Session.syncIndexes();
+    await Event.syncIndexes();
+  } catch (e) {
+    console.warn('Index sync failed:', e?.message || e);
+  }
   app.listen(PORT, () => console.log(`collector on :${PORT}`));
 })();
