@@ -14,16 +14,17 @@ app.use(express.json({ limit: '256kb' }));
 app.use(cors({
   origin: true, // or specify your domains: ['https://yourstore.com','https://checkout.shopify.com']
   methods: ['POST', 'GET', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'X-Collector-Key'],
+  allowedHeaders: ['Content-Type', 'X-Collector-Key', 'X-Brand'],
   maxAge: 86400
 }));
 
 app.options('/collect', cors());
 
-const { MONGO_URI, PORT = 3000, COLLECTOR_KEY } = process.env;
+const { MONGO_URI, PORT = 3000, COLLECTOR_KEY, COLLECTOR_KEYS } = process.env;
 
 // ---------- Mongo models ----------
 const sessionSchema = new mongoose.Schema({
+  brand_id:  { type: String, required: true, index: true },
   session_id: { type: String, required: true, index: true, unique: true },
   actor_id:   { type: String, required: true, index: true }, // visitor_id (preferred) or client_id
   started_at: { type: Date,   required: true, index: true },
@@ -42,6 +43,7 @@ const sessionSchema = new mongoose.Schema({
 sessionSchema.index({ actor_id: 1, last_event_at: -1 });
 
 const eventSchema = new mongoose.Schema({
+  brand_id:  { type: String, required: true, index: true },
   event_id:   { type: String, required: true, unique: true },
   session_id: { type: String, index: true },
   event_name: { type: String, required: true, index: true },
@@ -63,6 +65,12 @@ sessionSchema.index({ last_event_at: 1 }, { expireAfterSeconds: 21600 });
 // Events expire 6h after they occurred
 eventSchema.index({ occurred_at: 1 }, { expireAfterSeconds: 21600 });
 
+// Multi-tenant helpful indexes
+sessionSchema.index({ brand_id: 1, started_at: 1 });
+sessionSchema.index({ brand_id: 1, actor_id: 1, last_event_at: -1 });
+eventSchema.index({ brand_id: 1, event_name: 1, occurred_at: 1 });
+eventSchema.index({ brand_id: 1, session_id: 1, occurred_at: 1 });
+
 const Session = mongoose.model('Session', sessionSchema);
 const Event   = mongoose.model('Event', eventSchema);
 
@@ -82,6 +90,26 @@ const EventSchema = z.object({
 // ---------- Helpers ----------
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
 
+// Resolve brand and validate collector key
+const KEY_MAP = (() => {
+  try { return COLLECTOR_KEYS ? JSON.parse(COLLECTOR_KEYS) : null; } catch { return null; }
+})();
+
+function brandAuth(req, res, next) {
+  const brand = req.get('X-Brand');
+  const key = req.get('X-Collector-Key');
+  if (!brand) return res.status(400).json({ error: 'missing brand' });
+
+  if (KEY_MAP) {
+    const expected = KEY_MAP[brand];
+    if (!expected || key !== expected) return res.sendStatus(401);
+  } else {
+    if (!COLLECTOR_KEY || key !== COLLECTOR_KEY) return res.sendStatus(401);
+  }
+  req.brand = brand;
+  next();
+}
+
 function parseUTM(u) {
   try {
     if (!u) return {};
@@ -98,13 +126,9 @@ function parseUTM(u) {
 }
 
 // ---------- Routes ----------
-app.post('/collect', async (req, res) => {
+app.post('/collect', brandAuth, async (req, res) => {
   console.log("Received event:", req.body);
   try {
-    if (!COLLECTOR_KEY || req.get('X-Collector-Key') !== COLLECTOR_KEY) {
-      return res.sendStatus(401);
-    }
-
     const e = EventSchema.parse(req.body);
     const when = new Date(e.occurred_at);
     const actor = e.visitor_id || e.client_id; // prefer visitor_id, fallback to client_id
@@ -113,7 +137,7 @@ app.post('/collect', async (req, res) => {
     let sessionId = null;
     if (actor) {
       // find most recent session for this actor
-      const recent = await Session.findOne({ actor_id: actor })
+  const recent = await Session.findOne({ actor_id: actor, brand_id: req.brand })
         .sort({ last_event_at: -1 })
         .lean();
 
@@ -122,6 +146,7 @@ app.post('/collect', async (req, res) => {
         sessionId = uuid();
         const utm = parseUTM(e.url);
         await Session.create({
+          brand_id: req.brand,
           session_id: sessionId,
           actor_id: actor,
           started_at: when,
@@ -133,7 +158,7 @@ app.post('/collect', async (req, res) => {
       } else {
         sessionId = recent.session_id;
         await Session.updateOne(
-          { session_id: sessionId },
+          { session_id: sessionId, brand_id: req.brand },
           { $set: { last_event_at: when } }
         );
       }
@@ -144,6 +169,7 @@ app.post('/collect', async (req, res) => {
       { event_id: e.event_id },
       {
         $setOnInsert: {
+          brand_id: req.brand,
           event_id: e.event_id,
           session_id: sessionId,
           event_name: e.event_name,
@@ -168,18 +194,18 @@ app.post('/collect', async (req, res) => {
 
 // Example: quick KPI — sessions count in a range
 // GET /metrics/sessions?from=2025-08-01&to=2025-08-18
-app.get('/metrics/sessions', async (req, res) => {
+app.get('/metrics/sessions', brandAuth, async (req, res) => {
   try {
     const from = req.query.from ? new Date(req.query.from) : new Date(Date.now() - 24*60*60*1000);
     const to   = req.query.to   ? new Date(req.query.to)   : new Date();
-    const count = await Session.countDocuments({ started_at: { $gte: from, $lt: to } });
-    res.json({ from, to, sessions: count });
+  const count = await Session.countDocuments({ brand_id: req.brand, started_at: { $gte: from, $lt: to } });
+  res.json({ brand: req.brand, from, to, sessions: count });
   } catch (e) {
     res.status(400).json({ error: 'bad range' });
   }
 });
 
-app.get('/metrics/sessions/:timestamp',async (req,res)=>{
+app.get('/metrics/sessions/:timestamp', brandAuth, async (req,res)=>{
     try {
       const { timestamp } = req.params;
       const eventName = (req.query.eventName || 'add_to_cart').toString();
@@ -199,17 +225,18 @@ app.get('/metrics/sessions/:timestamp',async (req,res)=>{
       }
 
       // Count sessions started after timestamp
-      const totalSessionsPromise = Session.countDocuments({ started_at: { $gt: ts } });
+  const totalSessionsPromise = Session.countDocuments({ brand_id: req.brand, started_at: { $gt: ts } });
 
       // Count total events of the given name that occurred after timestamp
       const totalEventsPromise = Event.countDocuments({
+        brand_id: req.brand,
         event_name: eventName,
         occurred_at: { $gt: ts }
       });
 
       const [totalSessions, totalEvents] = await Promise.all([totalSessionsPromise, totalEventsPromise]);
 
-      return res.json({ from: ts, eventName, totalSessions, totalEvents });
+  return res.json({ brand: req.brand, from: ts, eventName, totalSessions, totalEvents });
     } catch (e) {
       console.error(e);
       return res.status(500).json({ error: 'internal' });
