@@ -102,6 +102,7 @@ function brandAuth(req, res, next) {
 
   if (KEY_MAP) {
     const expected = KEY_MAP[brand];
+    console.log(`Brand: ${brand}, Key: ${key}, Expected: ${expected}`);
     if (!expected || key !== expected) return res.sendStatus(401);
   } else {
     if (!COLLECTOR_KEY || key !== COLLECTOR_KEY) return res.sendStatus(401);
