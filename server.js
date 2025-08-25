@@ -128,6 +128,7 @@ function parseUTM(u) {
 // ---------- Routes ----------
 app.post('/collect', brandAuth, async (req, res) => {
   try {
+    console.log("Received event:", req.body);
     const e = EventSchema.parse(req.body);
     const when = new Date(e.occurred_at);
     const actor = e.visitor_id || e.client_id;
