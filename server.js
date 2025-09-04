@@ -92,6 +92,8 @@ const KEY_MAP = (() => {
   try { return COLLECTOR_KEYS ? JSON.parse(COLLECTOR_KEYS) : null; } catch { return null; }
 })();
 
+const safe = (v) => (v === undefined ? null : v);
+
 function brandAuth(req, res, next) {
   const brand = req.get('X-Brand');
   const key = req.get('X-Collector-Key');
@@ -126,6 +128,15 @@ function parseUTM(u) {
 app.post('/collect', brandAuth, async (req, res) => {
   try {
     console.log("Received event:", req.body);
+    const normalized = {
+      ...req.body,
+      client_id: safe(req.body.client_id),
+      visitor_id: safe(req.body.visitor_id),
+      url: safe(req.body.url),
+      referrer: safe(req.body.referrer),
+      user_agent: safe(req.body.user_agent)
+    };
+    req.body = normalized;
     const e = EventSchema.parse(req.body);
     const when = new Date(e.occurred_at);
     const actor = e.visitor_id || e.client_id;
