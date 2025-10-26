@@ -1,9 +1,11 @@
+// server.js
 import express from 'express';
 import helmet from 'helmet';
 import mongoose from 'mongoose';
 import { z } from 'zod';
 import { v4 as uuid } from 'uuid';
 import cors from 'cors';
+import crypto from 'crypto';
 
 const app = express();
 app.use(helmet());
@@ -38,6 +40,13 @@ const sessionSchema = new mongoose.Schema({
 
 sessionSchema.index({ actor_id: 1, last_event_at: -1 });
 
+// TTL indexes (6h)
+sessionSchema.index({ last_event_at: 1 }, { expireAfterSeconds: 21600 });
+
+// Useful compound indexes
+sessionSchema.index({ brand_id: 1, started_at: 1 });
+sessionSchema.index({ brand_id: 1, actor_id: 1, last_event_at: -1 });
+
 const eventSchema = new mongoose.Schema({
   brand_id: { type: String, required: true, index: true },
   event_id: { type: String, required: true, unique: true },
@@ -54,18 +63,23 @@ const eventSchema = new mongoose.Schema({
 
 eventSchema.index({ session_id: 1, occurred_at: 1 });
 
-// ✅ new: dedupe ATC by product_id per session
+// ✅ brand-scoped ATC dedupe w/ partial filter (requires strings)
 eventSchema.index(
-  { session_id: 1, event_name: 1, "raw.product_id": 1 },
-  { unique: true, partialFilterExpression: { event_name: "product_added_to_cart" } }
+  { brand_id: 1, session_id: 1, event_name: 1, "raw.product_id": 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      event_name: "product_added_to_cart",
+      session_id: { $type: "string" },
+      "raw.product_id": { $type: "string" }
+    }
+  }
 );
 
-// TTL indexes
-sessionSchema.index({ last_event_at: 1 }, { expireAfterSeconds: 21600 });
+// TTL (6h)
 eventSchema.index({ occurred_at: 1 }, { expireAfterSeconds: 21600 });
 
-sessionSchema.index({ brand_id: 1, started_at: 1 });
-sessionSchema.index({ brand_id: 1, actor_id: 1, last_event_at: -1 });
+// Additional helpful indexes
 eventSchema.index({ brand_id: 1, event_name: 1, occurred_at: 1 });
 eventSchema.index({ brand_id: 1, session_id: 1, occurred_at: 1 });
 
@@ -73,10 +87,11 @@ const Session = mongoose.model('Session', sessionSchema);
 const Event = mongoose.model('Event', eventSchema);
 
 // ---------- Validation ----------
-const EventSchema = z.object({
+const BaseEventSchema = z.object({
   event_id: z.string(),
   event_name: z.string(),
-  occurred_at: z.string(),
+  occurred_at: z.string(), // ISO timestamp from client
+  session_id: z.string().nullable().optional(), // NEW: accept client session id
   client_id: z.string().nullable(),
   visitor_id: z.string().nullable(),
   url: z.string().url().nullable(),
@@ -124,56 +139,81 @@ function parseUTM(u) {
   } catch { return {}; }
 }
 
+// Normalize Shopify gid -> stable string "ProductVariant:123" or "Product:456"
+function normalizeShopifyId(id) {
+  if (!id) return null;
+  try {
+    const s = String(id);
+    if (s.includes('/')) {
+      const parts = s.split('/');
+      const kind = parts.at(-2);
+      const num = parts.at(-1);
+      return `${kind}:${num}`;
+    }
+    return s;
+  } catch { return String(id); }
+}
+
+// Deterministic session id fallback when client didn't send vp_sid
+function deriveSid(brand, actor, when) {
+  const bucket = Math.floor(when.getTime() / SESSION_TIMEOUT_MS); // 30-min bucket
+  return crypto.createHash('sha1').update(`${brand}|${actor}|${bucket}`).digest('hex');
+}
+
 // ---------- Routes ----------
 app.post('/collect', brandAuth, async (req, res) => {
   try {
-    console.log("Received event:", req.body);
+    // sanitize/normalize body first
     const normalized = {
       ...req.body,
       client_id: safe(req.body.client_id),
       visitor_id: safe(req.body.visitor_id),
+      session_id: req.body.session_id ?? null,
       url: safe(req.body.url),
       referrer: safe(req.body.referrer),
       user_agent: safe(req.body.user_agent)
     };
-    req.body = normalized;
-    const e = EventSchema.parse(req.body);
+    const e = BaseEventSchema.parse(normalized);
+
     const when = new Date(e.occurred_at);
-    const actor = e.visitor_id || e.client_id;
+    if (isNaN(when.getTime())) return res.sendStatus(400);
 
-    let sessionId = null;
-    if (actor) {
-      const recent = await Session.findOne({ actor_id: actor, brand_id: req.brand })
-        .sort({ last_event_at: -1 })
-        .lean();
+    const actor = e.visitor_id || e.client_id || null;
 
-      if (!recent || (when - new Date(recent.last_event_at)) > SESSION_TIMEOUT_MS) {
-        sessionId = uuid();
-        const utm = parseUTM(e.url);
-        await Session.create({
-          brand_id: req.brand,
-          session_id: sessionId,
-          actor_id: actor,
-          started_at: when,
-          last_event_at: when,
-          landing_url: e.url || null,
-          landing_referrer: e.referrer || null,
-          ...utm
-        });
-      } else {
-        sessionId = recent.session_id;
-        await Session.updateOne(
-          { session_id: sessionId, brand_id: req.brand },
-          { $set: { last_event_at: when } }
-        );
-      }
+    // 1) choose session id
+    let sessionId = e.session_id || null;
+    if (!sessionId && actor) {
+      sessionId = deriveSid(req.brand, actor, when);
     }
 
-    // ✅ dedupe logic
-    if (e.event_name === "product_added_to_cart") {
-      const productId = e.data?.product_id || null;
+    // 2) upsert session if we have one
+    if (sessionId) {
+      const utm = parseUTM(e.url);
+      await Session.updateOne(
+        { brand_id: req.brand, session_id: sessionId },
+        {
+          $setOnInsert: {
+            brand_id: req.brand,
+            session_id: sessionId,
+            actor_id: actor || 'unknown',
+            started_at: when,
+            landing_url: e.url || null,
+            landing_referrer: e.referrer || null,
+            ...utm
+          },
+          $max: { last_event_at: when } // out-of-order safe
+        },
+        { upsert: true }
+      );
+    }
+
+    // 3) normalized product id for ATC dedupe
+    const productId = normalizeShopifyId(e.data?.product_id ?? null);
+
+    // 4) write event (ATC has special dedupe path)
+    if (e.event_name === "product_added_to_cart" && sessionId && productId) {
       await Event.updateOne(
-        { session_id: sessionId, event_name: e.event_name, "raw.product_id": productId },
+        { brand_id: req.brand, session_id: sessionId, event_name: e.event_name, "raw.product_id": productId },
         {
           $setOnInsert: {
             brand_id: req.brand,
@@ -206,7 +246,8 @@ app.post('/collect', brandAuth, async (req, res) => {
             user_agent: e.user_agent || null,
             client_id: e.client_id || null,
             visitor_id: e.visitor_id || null,
-            raw: e.data ?? null
+            raw: e.data ?? null,
+            why_no_session: sessionId ? null : (actor ? "server_derived" : "no_actor")
           }
         },
         { upsert: true }
@@ -235,7 +276,7 @@ app.get('/metrics/sessions', brandAuth, async (req, res) => {
 app.get('/metrics/sessions/:timestamp', brandAuth, async (req, res) => {
   try {
     const { timestamp } = req.params;
-    const eventName = (req.query.eventName || 'add_to_cart').toString();
+    const eventName = (req.query.eventName || 'product_added_to_cart').toString(); // default fixed
 
     let ts;
     if (/^\d+$/.test(timestamp)) {
@@ -249,14 +290,10 @@ app.get('/metrics/sessions/:timestamp', brandAuth, async (req, res) => {
       return res.status(400).json({ error: 'invalid timestamp' });
     }
 
-    const totalSessionsPromise = Session.countDocuments({ brand_id: req.brand, started_at: { $gt: ts } });
-    const totalEventsPromise = Event.countDocuments({
-      brand_id: req.brand,
-      event_name: eventName,
-      occurred_at: { $gt: ts }
-    });
-
-    const [totalSessions, totalEvents] = await Promise.all([totalSessionsPromise, totalEventsPromise]);
+    const [totalSessions, totalEvents] = await Promise.all([
+      Session.countDocuments({ brand_id: req.brand, started_at: { $gt: ts } }),
+      Event.countDocuments({ brand_id: req.brand, event_name: eventName, occurred_at: { $gt: ts } })
+    ]);
 
     return res.json({ brand: req.brand, from: ts, eventName, totalSessions, totalEvents });
   } catch (e) {
