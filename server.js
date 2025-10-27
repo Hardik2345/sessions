@@ -3,7 +3,6 @@ import express from 'express';
 import helmet from 'helmet';
 import mongoose from 'mongoose';
 import { z } from 'zod';
-import { v4 as uuid } from 'uuid';
 import cors from 'cors';
 import crypto from 'crypto';
 
@@ -12,20 +11,28 @@ app.use(helmet());
 app.use(express.json({ limit: '256kb' }));
 
 app.use(cors({
-  origin: true,
+  origin: true, // reflect request origin; tighten to exact origins if desired
   methods: ['POST', 'GET', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'X-Collector-Key', 'X-Brand'],
   maxAge: 86400
 }));
-
 app.options('/collect', cors());
 
-const { MONGO_URI, PORT = 3000, COLLECTOR_KEY, COLLECTOR_KEYS } = process.env;
+// ---------- Env ----------
+const {
+  MONGO_URI,
+  PORT = 3000,
+  COLLECTOR_KEY,
+  COLLECTOR_KEYS // JSON map: {"brandA":"keyA","brandB":"keyB"}
+} = process.env;
 
-// ---------- Mongo models ----------
+const KEY_MAP = (() => { try { return COLLECTOR_KEYS ? JSON.parse(COLLECTOR_KEYS) : null; } catch { return null; }})();
+const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
+
+// ---------- Schemas & Models ----------
 const sessionSchema = new mongoose.Schema({
   brand_id: { type: String, required: true, index: true },
-  session_id: { type: String, required: true, index: true, unique: true },
+  session_id: { type: String, required: true, unique: true, index: true },
   actor_id: { type: String, required: true, index: true },
   started_at: { type: Date, required: true, index: true },
   last_event_at: { type: Date, required: true },
@@ -39,11 +46,9 @@ const sessionSchema = new mongoose.Schema({
 }, { versionKey: false, collection: 'sessions' });
 
 sessionSchema.index({ actor_id: 1, last_event_at: -1 });
-
-// TTL indexes (6h)
+// TTL (6h)
 sessionSchema.index({ last_event_at: 1 }, { expireAfterSeconds: 21600 });
-
-// Useful compound indexes
+// Helpful compunds
 sessionSchema.index({ brand_id: 1, started_at: 1 });
 sessionSchema.index({ brand_id: 1, actor_id: 1, last_event_at: -1 });
 
@@ -62,8 +67,7 @@ const eventSchema = new mongoose.Schema({
 }, { versionKey: false, collection: 'events' });
 
 eventSchema.index({ session_id: 1, occurred_at: 1 });
-
-// ✅ brand-scoped ATC dedupe w/ partial filter (requires strings)
+// ✅ brand-scoped unique dedupe for ATC (engages only when both keys are strings)
 eventSchema.index(
   { brand_id: 1, session_id: 1, event_name: 1, "raw.product_id": 1 },
   {
@@ -75,11 +79,9 @@ eventSchema.index(
     }
   }
 );
-
 // TTL (6h)
 eventSchema.index({ occurred_at: 1 }, { expireAfterSeconds: 21600 });
-
-// Additional helpful indexes
+// Helpful compunds
 eventSchema.index({ brand_id: 1, event_name: 1, occurred_at: 1 });
 eventSchema.index({ brand_id: 1, session_id: 1, occurred_at: 1 });
 
@@ -87,11 +89,11 @@ const Session = mongoose.model('Session', sessionSchema);
 const Event = mongoose.model('Event', eventSchema);
 
 // ---------- Validation ----------
-const BaseEventSchema = z.object({
+const EventSchema = z.object({
   event_id: z.string(),
   event_name: z.string(),
-  occurred_at: z.string(), // ISO timestamp from client
-  session_id: z.string().nullable().optional(), // NEW: accept client session id
+  occurred_at: z.string(),               // ISO string from client
+  session_id: z.string().nullable().optional(),
   client_id: z.string().nullable(),
   visitor_id: z.string().nullable(),
   url: z.string().url().nullable(),
@@ -101,24 +103,30 @@ const BaseEventSchema = z.object({
 });
 
 // ---------- Helpers ----------
-const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
+const safe = v => (v === undefined ? null : v);
 
-const KEY_MAP = (() => {
-  try { return COLLECTOR_KEYS ? JSON.parse(COLLECTOR_KEYS) : null; } catch { return null; }
-})();
+function getHeader(req, name) {
+  const v = req.get(name);
+  return typeof v === 'string' ? v.trim() : null;
+}
 
-const safe = (v) => (v === undefined ? null : v);
+// auth via headers OR query (?brand=&k=)
+function pickAuth(req) {
+  let brand = getHeader(req, 'X-Brand');
+  let key   = getHeader(req, 'X-Collector-Key');
+  if (!brand) brand = (req.query.brand ?? req.query.b)?.toString().trim() || null;
+  if (!key)   key   = (req.query.k ?? req.query.key)?.toString().trim() || null;
+  return { brand, key };
+}
 
 function brandAuth(req, res, next) {
-  const brand = req.get('X-Brand');
-  const key = req.get('X-Collector-Key');
+  const { brand, key } = pickAuth(req);
   if (!brand) return res.status(400).json({ error: 'missing brand' });
 
-  if (KEY_MAP) {
-    const expected = KEY_MAP[brand];
-    if (!expected || key !== expected) return res.sendStatus(401);
-  } else {
-    if (!COLLECTOR_KEY || key !== COLLECTOR_KEY) return res.sendStatus(401);
+  const expected = KEY_MAP ? KEY_MAP[brand] : (COLLECTOR_KEY || null);
+  if (!expected || key !== expected) {
+    console.warn('auth_fail', { path: req.path, brand, hasKey: Boolean(key) });
+    return res.sendStatus(401);
   }
   req.brand = brand;
   next();
@@ -139,31 +147,34 @@ function parseUTM(u) {
   } catch { return {}; }
 }
 
-// Normalize Shopify gid -> stable string "ProductVariant:123" or "Product:456"
+// Normalize Shopify gid -> "ProductVariant:123"
 function normalizeShopifyId(id) {
   if (!id) return null;
-  try {
-    const s = String(id);
-    if (s.includes('/')) {
-      const parts = s.split('/');
-      const kind = parts.at(-2);
-      const num = parts.at(-1);
-      return `${kind}:${num}`;
-    }
-    return s;
-  } catch { return String(id); }
+  const s = String(id);
+  if (s.includes('/')) {
+    const parts = s.split('/');
+    const kind = parts.at(-2);
+    const num  = parts.at(-1);
+    return `${kind}:${num}`;
+  }
+  return s;
 }
 
-// Deterministic session id fallback when client didn't send vp_sid
+// Deterministic session fallback (keeps dedupe working even without client vp_sid)
 function deriveSid(brand, actor, when) {
   const bucket = Math.floor(when.getTime() / SESSION_TIMEOUT_MS); // 30-min bucket
   return crypto.createHash('sha1').update(`${brand}|${actor}|${bucket}`).digest('hex');
 }
 
+// If product_id still missing, synthesize a short, stable string so the unique index engages
+function synthPid(brand, sessionId, e) {
+  const src = `${brand}|${sessionId || "nosid"}|${e.event_id}|${e.url || ""}`;
+  return "SYNTH:" + crypto.createHash('sha1').update(src).digest('hex').slice(0, 16);
+}
+
 // ---------- Routes ----------
 app.post('/collect', brandAuth, async (req, res) => {
   try {
-    // sanitize/normalize body first
     const normalized = {
       ...req.body,
       client_id: safe(req.body.client_id),
@@ -173,20 +184,20 @@ app.post('/collect', brandAuth, async (req, res) => {
       referrer: safe(req.body.referrer),
       user_agent: safe(req.body.user_agent)
     };
-    const e = BaseEventSchema.parse(normalized);
+    const e = EventSchema.parse(normalized);
 
     const when = new Date(e.occurred_at);
     if (isNaN(when.getTime())) return res.sendStatus(400);
 
     const actor = e.visitor_id || e.client_id || null;
 
-    // 1) choose session id
+    // Choose a session id: prefer client vp_sid; fall back to deterministic server sid
     let sessionId = e.session_id || null;
     if (!sessionId && actor) {
       sessionId = deriveSid(req.brand, actor, when);
     }
 
-    // 2) upsert session if we have one
+    // Upsert session when we have an id; use $max for last_event_at
     if (sessionId) {
       const utm = parseUTM(e.url);
       await Session.updateOne(
@@ -201,17 +212,18 @@ app.post('/collect', brandAuth, async (req, res) => {
             landing_referrer: e.referrer || null,
             ...utm
           },
-          $max: { last_event_at: when } // out-of-order safe
+          $max: { last_event_at: when }
         },
         { upsert: true }
       );
     }
 
-    // 3) normalized product id for ATC dedupe
-    const productId = normalizeShopifyId(e.data?.product_id ?? null);
+    // Ensure productId is a non-null string for ATC dedupe
+    let productId = normalizeShopifyId(e?.data?.product_id ?? null);
+    if (!productId) productId = synthPid(req.brand, sessionId, e);
 
-    // 4) write event (ATC has special dedupe path)
-    if (e.event_name === "product_added_to_cart" && sessionId && productId) {
+    // Write event: ATC has dedupe path keyed on (brand, session_id, event_name, raw.product_id)
+    if (e.event_name === 'product_added_to_cart' && sessionId && productId) {
       await Event.updateOne(
         { brand_id: req.brand, session_id: sessionId, event_name: e.event_name, "raw.product_id": productId },
         {
@@ -232,6 +244,7 @@ app.post('/collect', brandAuth, async (req, res) => {
         { upsert: true }
       );
     } else {
+      // generic idempotent write (replays collapse on event_id)
       await Event.updateOne(
         { event_id: e.event_id },
         {
@@ -246,18 +259,17 @@ app.post('/collect', brandAuth, async (req, res) => {
             user_agent: e.user_agent || null,
             client_id: e.client_id || null,
             visitor_id: e.visitor_id || null,
-            raw: e.data ?? null,
-            why_no_session: sessionId ? null : (actor ? "server_derived" : "no_actor")
+            raw: e.data ?? null
           }
         },
         { upsert: true }
       );
     }
 
-    return res.sendStatus(204);
+    res.sendStatus(204);
   } catch (err) {
     console.error(err);
-    return res.sendStatus(400);
+    res.sendStatus(400);
   }
 });
 
@@ -265,10 +277,10 @@ app.post('/collect', brandAuth, async (req, res) => {
 app.get('/metrics/sessions', brandAuth, async (req, res) => {
   try {
     const from = req.query.from ? new Date(req.query.from) : new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const to = req.query.to ? new Date(req.query.to) : new Date();
+    const to   = req.query.to   ? new Date(req.query.to)   : new Date();
     const count = await Session.countDocuments({ brand_id: req.brand, started_at: { $gte: from, $lt: to } });
     res.json({ brand: req.brand, from, to, sessions: count });
-  } catch (e) {
+  } catch {
     res.status(400).json({ error: 'bad range' });
   }
 });
@@ -276,7 +288,7 @@ app.get('/metrics/sessions', brandAuth, async (req, res) => {
 app.get('/metrics/sessions/:timestamp', brandAuth, async (req, res) => {
   try {
     const { timestamp } = req.params;
-    const eventName = (req.query.eventName || 'product_added_to_cart').toString(); // default fixed
+    const eventName = (req.query.eventName || 'product_added_to_cart').toString();
 
     let ts;
     if (/^\d+$/.test(timestamp)) {
@@ -286,19 +298,17 @@ app.get('/metrics/sessions/:timestamp', brandAuth, async (req, res) => {
     } else {
       ts = new Date(timestamp);
     }
-    if (isNaN(ts.getTime())) {
-      return res.status(400).json({ error: 'invalid timestamp' });
-    }
+    if (isNaN(ts.getTime())) return res.status(400).json({ error: 'invalid timestamp' });
 
     const [totalSessions, totalEvents] = await Promise.all([
       Session.countDocuments({ brand_id: req.brand, started_at: { $gt: ts } }),
       Event.countDocuments({ brand_id: req.brand, event_name: eventName, occurred_at: { $gt: ts } })
     ]);
 
-    return res.json({ brand: req.brand, from: ts, eventName, totalSessions, totalEvents });
+    res.json({ brand: req.brand, from: ts, eventName, totalSessions, totalEvents });
   } catch (e) {
     console.error(e);
-    return res.status(500).json({ error: 'internal' });
+    res.status(500).json({ error: 'internal' });
   }
 });
 
@@ -316,5 +326,5 @@ app.get('/healthz', (_, res) => res.json({ ok: true }));
   } catch (e) {
     console.warn('Index sync failed:', e?.message || e);
   }
-  app.listen(PORT, () => console.log(`collector on :${PORT}`));
+  app.listen(PORT, () => console.log(`collector listening on :${PORT}`));
 })();
