@@ -11,7 +11,7 @@ app.use(helmet());
 app.use(express.json({ limit: '256kb' }));
 
 app.use(cors({
-  origin: true, // reflect request origin; tighten to exact origins if desired
+  origin: true,
   methods: ['POST', 'GET', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'X-Collector-Key', 'X-Brand'],
   maxAge: 86400
@@ -34,6 +34,7 @@ const sessionSchema = new mongoose.Schema({
   brand_id: { type: String, required: true, index: true },
   session_id: { type: String, required: true, unique: true, index: true },
   actor_id: { type: String, required: true, index: true },
+  session_sig: { type: String, index: true }, // race-proof signature for a landing
   started_at: { type: Date, required: true, index: true },
   last_event_at: { type: Date, required: true },
   landing_url: { type: String },
@@ -46,11 +47,13 @@ const sessionSchema = new mongoose.Schema({
 }, { versionKey: false, collection: 'sessions' });
 
 sessionSchema.index({ actor_id: 1, last_event_at: -1 });
-// TTL (6h)
-sessionSchema.index({ last_event_at: 1 }, { expireAfterSeconds: 21600 });
-// Helpful compunds
+sessionSchema.index({ last_event_at: 1 }, { expireAfterSeconds: 21600 }); // TTL 6h
 sessionSchema.index({ brand_id: 1, started_at: 1 });
 sessionSchema.index({ brand_id: 1, actor_id: 1, last_event_at: -1 });
+sessionSchema.index(
+  { brand_id: 1, actor_id: 1, session_sig: 1 },
+  { unique: true, partialFilterExpression: { session_sig: { $type: "string" } } }
+);
 
 const eventSchema = new mongoose.Schema({
   brand_id: { type: String, required: true, index: true },
@@ -67,7 +70,6 @@ const eventSchema = new mongoose.Schema({
 }, { versionKey: false, collection: 'events' });
 
 eventSchema.index({ session_id: 1, occurred_at: 1 });
-// ✅ brand-scoped unique dedupe for ATC (engages only when both keys are strings)
 eventSchema.index(
   { brand_id: 1, session_id: 1, event_name: 1, "raw.product_id": 1 },
   {
@@ -79,9 +81,7 @@ eventSchema.index(
     }
   }
 );
-// TTL (6h)
-eventSchema.index({ occurred_at: 1 }, { expireAfterSeconds: 21600 });
-// Helpful compunds
+eventSchema.index({ occurred_at: 1 }, { expireAfterSeconds: 21600 }); // TTL 6h
 eventSchema.index({ brand_id: 1, event_name: 1, occurred_at: 1 });
 eventSchema.index({ brand_id: 1, session_id: 1, occurred_at: 1 });
 
@@ -92,7 +92,7 @@ const Event = mongoose.model('Event', eventSchema);
 const EventSchema = z.object({
   event_id: z.string(),
   event_name: z.string(),
-  occurred_at: z.string(),               // ISO string from client
+  occurred_at: z.string(),               // ISO string
   session_id: z.string().nullable().optional(),
   client_id: z.string().nullable(),
   visitor_id: z.string().nullable(),
@@ -104,13 +104,9 @@ const EventSchema = z.object({
 
 // ---------- Helpers ----------
 const safe = v => (v === undefined ? null : v);
+const hostOf = (u) => { try { return u ? new URL(u).host : null; } catch { return null; } };
 
-function getHeader(req, name) {
-  const v = req.get(name);
-  return typeof v === 'string' ? v.trim() : null;
-}
-
-// auth via headers OR query (?brand=&k=)
+function getHeader(req, name) { const v = req.get(name); return typeof v === 'string' ? v.trim() : null; }
 function pickAuth(req) {
   let brand = getHeader(req, 'X-Brand');
   let key   = getHeader(req, 'X-Collector-Key');
@@ -118,16 +114,11 @@ function pickAuth(req) {
   if (!key)   key   = (req.query.k ?? req.query.key)?.toString().trim() || null;
   return { brand, key };
 }
-
 function brandAuth(req, res, next) {
   const { brand, key } = pickAuth(req);
   if (!brand) return res.status(400).json({ error: 'missing brand' });
-
   const expected = KEY_MAP ? KEY_MAP[brand] : (COLLECTOR_KEY || null);
-  if (!expected || key !== expected) {
-    console.warn('auth_fail', { path: req.path, brand, hasKey: Boolean(key) });
-    return res.sendStatus(401);
-  }
+  if (!expected || key !== expected) return res.sendStatus(401);
   req.brand = brand;
   next();
 }
@@ -147,29 +138,57 @@ function parseUTM(u) {
   } catch { return {}; }
 }
 
-// Normalize Shopify gid -> "ProductVariant:123"
+// Shopify gid → "ProductVariant:123"
 function normalizeShopifyId(id) {
   if (!id) return null;
   const s = String(id);
-  if (s.includes('/')) {
-    const parts = s.split('/');
-    const kind = parts.at(-2);
-    const num  = parts.at(-1);
-    return `${kind}:${num}`;
-  }
+  if (s.includes('/')) { const parts = s.split('/'); return `${parts.at(-2)}:${parts.at(-1)}`; }
   return s;
 }
 
-// Deterministic session fallback (keeps dedupe working even without client vp_sid)
+// Fallback ONLY for continuing sessions without client session_id
 function deriveSid(brand, actor, when) {
-  const bucket = Math.floor(when.getTime() / SESSION_TIMEOUT_MS); // 30-min bucket
+  const bucket = Math.floor(when.getTime() / SESSION_TIMEOUT_MS);
   return crypto.createHash('sha1').update(`${brand}|${actor}|${bucket}`).digest('hex');
 }
 
-// If product_id still missing, synthesize a short, stable string so the unique index engages
+// Deterministic product id if missing
 function synthPid(brand, sessionId, e) {
   const src = `${brand}|${sessionId || "nosid"}|${e.event_id}|${e.url || ""}`;
   return "SYNTH:" + crypto.createHash('sha1').update(src).digest('hex').slice(0, 16);
+}
+
+// Landing signature (bucket × utm trio × external ref host)
+function makeSessionSig(when, url, referrer, utm) {
+  const bucket = Math.floor(when.getTime() / SESSION_TIMEOUT_MS);
+  const urlHost = hostOf(url);
+  const refHost = hostOf(referrer);
+  const extRef = (refHost && urlHost && refHost !== urlHost) ? refHost : 'direct';
+  const src = [
+    bucket,
+    (utm.utm_source || '-').toLowerCase(),
+    (utm.utm_medium || '-').toLowerCase(),
+    (utm.utm_campaign || '-').toLowerCase(),
+    extRef.toLowerCase()
+  ].join('|');
+  return crypto.createHash('sha1').update(src).digest('hex');
+}
+
+// Source-class mapping & UTM key
+function sourceClassFromHost(h) {
+  if (!h) return 'direct';
+  const s = h.toLowerCase();
+  if (/(^|\.)instagram\.com$/.test(s) || /(^|\.)facebook\.com$/.test(s) || /^fb(\.|$)/.test(s) || /(^|\.)l\.facebook\.com$/.test(s) || /(^|\.)l\.instagram\.com$/.test(s) || /(^|\.)m\.facebook\.com$/.test(s))
+    return 'facebook';
+  if (/(^|\.)google\./.test(s)) return 'google';
+  if (/(^|\.)bing\.com$/.test(s)) return 'bing';
+  return 'other';
+}
+function utmKey(utm) {
+  const a = (utm.utm_source||'').trim().toLowerCase();
+  const b = (utm.utm_medium||'').trim().toLowerCase();
+  const c = (utm.utm_campaign||'').trim().toLowerCase();
+  return (a||b||c) ? `${a}|${b}|${c}` : null; // null = no campaign
 }
 
 // ---------- Routes ----------
@@ -191,38 +210,100 @@ app.post('/collect', brandAuth, async (req, res) => {
 
     const actor = e.visitor_id || e.client_id || null;
 
-    // Choose a session id: prefer client vp_sid; fall back to deterministic server sid
+    // --- Current request features ---
+    const isPV = e.event_name === 'page_viewed';
+    const utmNow = parseUTM(e.url);
+    const urlHostNow = hostOf(e.url);
+    const refHostNow = hostOf(e.referrer);
+    const externalRef = !!(refHostNow && urlHostNow && refHostNow !== urlHostNow);
+    const refClassNow = externalRef ? sourceClassFromHost(refHostNow) : 'direct';
+    const utmNowKey = utmKey(utmNow);
+
     let sessionId = e.session_id || null;
-    if (!sessionId && actor) {
-      sessionId = deriveSid(req.brand, actor, when);
+
+    if (actor) {
+      const recent = await Session.findOne({ actor_id: actor, brand_id: req.brand })
+        .sort({ last_event_at: -1 })
+        .lean();
+
+      const within30m = !!(recent && (when - new Date(recent.last_event_at) <= SESSION_TIMEOUT_MS));
+
+      // --- Previous session features ---
+      const prevRefHost  = hostOf(recent?.landing_referrer || null);
+      const prevUrlHost  = hostOf(recent?.landing_url || null);
+      const prevExternal = !!(prevRefHost && prevUrlHost && prevRefHost !== prevUrlHost);
+      const prevRefClass = prevExternal ? sourceClassFromHost(prevRefHost) : 'direct';
+      const prevUtmKey   = utmKey({
+        utm_source: recent?.utm_source,
+        utm_medium: recent?.utm_medium,
+        utm_campaign: recent?.utm_campaign
+      });
+
+      // Debounce to avoid rapid IG/FB ↔ app hops for source-only changes
+      const startedAgoMs = recent ? (when - new Date(recent.started_at)) : Number.POSITIVE_INFINITY;
+      const debounceMs = 5 * 60 * 1000;
+
+      // Split rules (only considered on PV)
+      const utmChanged    = isPV && !!utmNowKey && (utmNowKey !== prevUtmKey);
+      const sourceChanged = isPV && (refClassNow !== prevRefClass) &&
+                            refClassNow !== 'direct' && prevRefClass !== 'direct' &&
+                            (startedAgoMs >= debounceMs);
+
+      const shouldSplit = within30m && (utmChanged || sourceChanged);
+
+      if (!recent || !within30m || shouldSplit) {
+        // NEW session; fresh UUID; session_sig prevents race double-creates
+        const sig = makeSessionSig(when, e.url, e.referrer, utmNow);
+        const base = { brand_id: req.brand, actor_id: actor, session_sig: sig };
+
+        async function upsertSessionWithNewId() {
+          const sid = crypto.randomUUID();
+          const up = await Session.findOneAndUpdate(
+            base,
+            {
+              $setOnInsert: {
+                ...base,
+                session_id: sid,
+                started_at: when,
+                landing_url: e.url || null,
+                landing_referrer: e.referrer || null,
+                utm_source: utmNow.utm_source || null,
+                utm_medium: utmNow.utm_medium || null,
+                utm_campaign: utmNow.utm_campaign || null,
+                utm_term: utmNow.utm_term || null,
+                utm_content: utmNow.utm_content || null
+              },
+              $max: { last_event_at: when } // creates/updates last_event_at
+            },
+            { upsert: true, new: true }
+          ).lean();
+          return up.session_id;
+        }
+
+        try {
+          sessionId = await upsertSessionWithNewId();
+        } catch (err) {
+          if (err?.code === 11000 && err?.keyPattern?.session_id) {
+            // extremely rare: retry once on session_id collision
+            sessionId = await upsertSessionWithNewId();
+          } else {
+            throw err;
+          }
+        }
+      } else {
+        // Continue existing session; if client didn't send session_id, derive fallback
+        sessionId = sessionId || recent.session_id || deriveSid(req.brand, actor, when);
+        await Session.updateOne(
+          { brand_id: req.brand, session_id: sessionId },
+          { $max: { last_event_at: when } }
+        );
+      }
     }
 
-    // Upsert session when we have an id; use $max for last_event_at
-    if (sessionId) {
-      const utm = parseUTM(e.url);
-      await Session.updateOne(
-        { brand_id: req.brand, session_id: sessionId },
-        {
-          $setOnInsert: {
-            brand_id: req.brand,
-            session_id: sessionId,
-            actor_id: actor || 'unknown',
-            started_at: when,
-            landing_url: e.url || null,
-            landing_referrer: e.referrer || null,
-            ...utm
-          },
-          $max: { last_event_at: when }
-        },
-        { upsert: true }
-      );
-    }
-
-    // Ensure productId is a non-null string for ATC dedupe
+    // --- ATC write path (requires session + product) ---
     let productId = normalizeShopifyId(e?.data?.product_id ?? null);
     if (!productId) productId = synthPid(req.brand, sessionId, e);
 
-    // Write event: ATC has dedupe path keyed on (brand, session_id, event_name, raw.product_id)
     if (e.event_name === 'product_added_to_cart' && sessionId && productId) {
       await Event.updateOne(
         { brand_id: req.brand, session_id: sessionId, event_name: e.event_name, "raw.product_id": productId },
@@ -244,7 +325,7 @@ app.post('/collect', brandAuth, async (req, res) => {
         { upsert: true }
       );
     } else {
-      // generic idempotent write (replays collapse on event_id)
+      // generic idempotent event write
       await Event.updateOne(
         { event_id: e.event_id },
         {
