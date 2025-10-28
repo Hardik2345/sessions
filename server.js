@@ -417,8 +417,9 @@ app.get('/metrics/sessions', brandAuth, async (req, res) => {
 app.get('/metrics/sessions/:timestamp', brandAuth, async (req, res) => {
   try {
     const { timestamp } = req.params;
-    const eventName = (req.query.eventName || 'product_added_to_cart').toString();
+    const eventName = 'product_added_to_cart';
 
+    // Parse timestamp (supports both epoch and ISO)
     let ts;
     if (/^\d+$/.test(timestamp)) {
       const n = Number(timestamp);
@@ -427,19 +428,54 @@ app.get('/metrics/sessions/:timestamp', brandAuth, async (req, res) => {
     } else {
       ts = new Date(timestamp);
     }
-    if (isNaN(ts.getTime())) return res.status(400).json({ error: 'invalid timestamp' });
+    if (isNaN(ts.getTime())) {
+      return res.status(400).json({ error: 'invalid timestamp' });
+    }
 
-    const [totalSessions, totalEvents] = await Promise.all([
-      Session.countDocuments({ brand_id: req.brand, started_at: { $gt: ts } }),
-      Event.countDocuments({ brand_id: req.brand, event_name: eventName, occurred_at: { $gt: ts } })
+    // Optional ?to=<time> upper bound, defaults to now
+    const to = req.query.to ? new Date(req.query.to) : new Date();
+    if (isNaN(to.getTime())) {
+      return res.status(400).json({ error: 'invalid to timestamp' });
+    }
+
+    // Prepare both queries (but don't await yet)
+    const sessionsPromise = Session.countDocuments({
+      brand_id: req.brand,
+      started_at: { $gt: ts, $lte: to }
+    });
+
+    const atcSessionsPromise = Event.aggregate([
+      {
+        $match: {
+          brand_id: req.brand,
+          event_name: eventName,
+          occurred_at: { $gt: ts, $lte: to },
+          session_id: { $type: 'string' }
+        }
+      },
+      { $group: { _id: '$session_id' } },
+      { $count: 'unique_atc_sessions' }
     ]);
 
-    res.json({ brand: req.brand, from: ts, eventName, totalSessions, totalEvents });
+    // Run in parallel
+    const [totalSessions, atcAgg] = await Promise.all([sessionsPromise, atcSessionsPromise]);
+
+    const totalAtcSessions = atcAgg?.[0]?.unique_atc_sessions || 0;
+
+    res.json({
+      brand: req.brand,
+      from: ts,
+      to,
+      eventName,
+      totalSessions,
+      totalAtcSessions
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'internal' });
   }
 });
+
 
 app.get('/healthz', (_, res) => res.json({ ok: true }));
 
