@@ -468,7 +468,7 @@ app.get('/metrics/sessions/:timestamp', brandAuth, async (req, res) => {
       to,
       eventName,
       totalSessions,
-      totalAtcSessions
+      totalEvents: totalAtcSessions
     });
   } catch (e) {
     console.error(e);
