@@ -27,9 +27,21 @@ const {
 } = process.env;
 
 const KEY_MAP = (() => { try { return COLLECTOR_KEYS ? JSON.parse(COLLECTOR_KEYS) : null; } catch { return null; }})();
-const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
+const SESSION_TIMEOUT_MS = 30 * 60 * 1000;     // 30 min inactivity window
+const SPLIT_DEBOUNCE_MS  = 10 * 60 * 1000;     // <=10 min: don't split if source class unchanged
 
 // ---------- Schemas & Models ----------
+const CampaignTouchSchema = new mongoose.Schema({
+  at: { type: Date, required: true },
+  utm_source: String,
+  utm_medium: String,
+  utm_campaign: String,
+  utm_term: String,
+  utm_content: String,
+  url: String,
+  referrer: String
+}, { _id: false });
+
 const sessionSchema = new mongoose.Schema({
   brand_id: { type: String, required: true, index: true },
   session_id: { type: String, required: true, unique: true, index: true },
@@ -43,7 +55,8 @@ const sessionSchema = new mongoose.Schema({
   utm_medium: String,
   utm_campaign: String,
   utm_term: String,
-  utm_content: String
+  utm_content: String,
+  campaign_touches: { type: [CampaignTouchSchema], default: [] }
 }, { versionKey: false, collection: 'sessions' });
 
 sessionSchema.index({ actor_id: 1, last_event_at: -1 });
@@ -226,6 +239,7 @@ app.post('/collect', brandAuth, async (req, res) => {
         .sort({ last_event_at: -1 })
         .lean();
 
+      const hasRecent = !!recent;
       const within30m = !!(recent && (when - new Date(recent.last_event_at) <= SESSION_TIMEOUT_MS));
 
       // --- Previous session features ---
@@ -233,25 +247,20 @@ app.post('/collect', brandAuth, async (req, res) => {
       const prevUrlHost  = hostOf(recent?.landing_url || null);
       const prevExternal = !!(prevRefHost && prevUrlHost && prevRefHost !== prevUrlHost);
       const prevRefClass = prevExternal ? sourceClassFromHost(prevRefHost) : 'direct';
-      const prevUtmKey   = utmKey({
-        utm_source: recent?.utm_source,
-        utm_medium: recent?.utm_medium,
-        utm_campaign: recent?.utm_campaign
-      });
 
-      // Debounce to avoid rapid IG/FB ↔ app hops for source-only changes
-      const startedAgoMs = recent ? (when - new Date(recent.started_at)) : Number.POSITIVE_INFINITY;
-      const debounceMs = 5 * 60 * 1000;
+      const within10mOfStart = !!(recent && (when - new Date(recent.started_at) <= SPLIT_DEBOUNCE_MS));
 
-      // Split rules (only considered on PV)
-      const utmChanged    = isPV && !!utmNowKey && (utmNowKey !== prevUtmKey);
-      const sourceChanged = isPV && (refClassNow !== prevRefClass) &&
-                            refClassNow !== 'direct' && prevRefClass !== 'direct' &&
-                            (startedAgoMs >= debounceMs);
+      // RULE IMPLEMENTATION:
+      // 1) If PV arrives within 10 min of session start AND referrer class unchanged -> DO NOT split (even if UTM changed)
+      const dontSplitWithin10SameSource = isPV && within10mOfStart && (refClassNow === prevRefClass);
 
-      const shouldSplit = within30m && (utmChanged || sourceChanged);
+      // 2) Otherwise, split only if PV and referrer class changed (non-direct to non-direct)
+      const sourceChanged = isPV && (refClassNow !== prevRefClass) && refClassNow !== 'direct' && prevRefClass !== 'direct';
 
-      if (!recent || !within30m || shouldSplit) {
+      const needNewSession =
+        !hasRecent || !within30m || (sourceChanged && !dontSplitWithin10SameSource);
+
+      if (needNewSession) {
         // NEW session; fresh UUID; session_sig prevents race double-creates
         const sig = makeSessionSig(when, e.url, e.referrer, utmNow);
         const base = { brand_id: req.brand, actor_id: actor, session_sig: sig };
@@ -265,15 +274,25 @@ app.post('/collect', brandAuth, async (req, res) => {
                 ...base,
                 session_id: sid,
                 started_at: when,
+                last_event_at: when,
                 landing_url: e.url || null,
                 landing_referrer: e.referrer || null,
                 utm_source: utmNow.utm_source || null,
                 utm_medium: utmNow.utm_medium || null,
                 utm_campaign: utmNow.utm_campaign || null,
                 utm_term: utmNow.utm_term || null,
-                utm_content: utmNow.utm_content || null
-              },
-              $max: { last_event_at: when } // creates/updates last_event_at
+                utm_content: utmNow.utm_content || null,
+                campaign_touches: utmNowKey ? [{
+                  at: when,
+                  utm_source: utmNow.utm_source || null,
+                  utm_medium: utmNow.utm_medium || null,
+                  utm_campaign: utmNow.utm_campaign || null,
+                  utm_term: utmNow.utm_term || null,
+                  utm_content: utmNow.utm_content || null,
+                  url: e.url || null,
+                  referrer: e.referrer || null
+                }] : []
+              }
             },
             { upsert: true, new: true }
           ).lean();
@@ -291,11 +310,40 @@ app.post('/collect', brandAuth, async (req, res) => {
           }
         }
       } else {
-        // Continue existing session; if client didn't send session_id, derive fallback
+        // CONTINUE existing session (no split)
         sessionId = sessionId || recent.session_id || deriveSid(req.brand, actor, when);
+
+        // Always advance last_event_at safely
         await Session.updateOne(
           { brand_id: req.brand, session_id: sessionId },
-          { $max: { last_event_at: when } }
+          {
+            $max: { last_event_at: when },
+            // If the primary UTM fields are empty, set them from this landing
+            $set: {
+              ...(isPV ? {
+                utm_source: recent?.utm_source ?? utmNow.utm_source ?? null,
+                utm_medium: recent?.utm_medium ?? utmNow.utm_medium ?? null,
+                utm_campaign: recent?.utm_campaign ?? utmNow.utm_campaign ?? null,
+                utm_term: recent?.utm_term ?? utmNow.utm_term ?? null,
+                utm_content: recent?.utm_content ?? utmNow.utm_content ?? null
+              } : {})
+            },
+            // Always append a campaign_touch entry when PV has any UTM signal
+            ...(isPV && utmNowKey ? {
+              $push: {
+                campaign_touches: {
+                  at: when,
+                  utm_source: utmNow.utm_source || null,
+                  utm_medium: utmNow.utm_medium || null,
+                  utm_campaign: utmNow.utm_campaign || null,
+                  utm_term: utmNow.utm_term || null,
+                  utm_content: utmNow.utm_content || null,
+                  url: e.url || null,
+                  referrer: e.referrer || null
+                }
+              }
+            } : {})
+          }
         );
       }
     }
