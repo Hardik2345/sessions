@@ -204,6 +204,141 @@ function utmKey(utm) {
   return (a||b||c) ? `${a}|${b}|${c}` : null; // null = no campaign
 }
 
+// ---------- ATC-only session hardening ----------
+async function ensureSessionForATC({ brand, actor, when, url, referrer, sessionId }) {
+  const utm = parseUTM(url);
+  const hasUtm = !!utmKey(utm);
+
+  if (sessionId) {
+    // If a session with this id exists: patch blanks + advance last_event_at
+    const existing = await Session.findOne({ brand_id: brand, session_id: sessionId }).lean();
+    if (existing) {
+      const set = {};
+      if (!existing.landing_url)      set.landing_url      = url || null;
+      if (!existing.landing_referrer) set.landing_referrer = referrer || null;
+      if (!existing.utm_source && utm.utm_source)   set.utm_source = utm.utm_source;
+      if (!existing.utm_medium && utm.utm_medium)   set.utm_medium = utm.utm_medium;
+      if (!existing.utm_campaign && utm.utm_campaign) set.utm_campaign = utm.utm_campaign;
+      if (!existing.utm_term && utm.utm_term)       set.utm_term = utm.utm_term;
+      if (!existing.utm_content && utm.utm_content) set.utm_content = utm.utm_content;
+
+      const update = { $max: { last_event_at: when } };
+      if (Object.keys(set).length) update.$set = set;
+      if (hasUtm) {
+        update.$push = {
+          campaign_touches: {
+            at: when,
+            utm_source: utm.utm_source || null,
+            utm_medium: utm.utm_medium || null,
+            utm_campaign: utm.utm_campaign || null,
+            utm_term: utm.utm_term || null,
+            utm_content: utm.utm_content || null,
+            url: url || null,
+            referrer: referrer || null
+          }
+        };
+      }
+      await Session.updateOne({ brand_id: brand, session_id: sessionId }, update);
+      return sessionId;
+    }
+
+    // No session doc exists: create a stub with this session_id
+    await Session.updateOne(
+      { brand_id: brand, session_id: sessionId },
+      {
+        $setOnInsert: {
+          brand_id: brand,
+          session_id: sessionId,
+          actor_id: actor || 'anon',
+          started_at: when,
+          last_event_at: when,
+          landing_url: url || null,
+          landing_referrer: referrer || null,
+          utm_source: utm.utm_source || null,
+          utm_medium: utm.utm_medium || null,
+          utm_campaign: utm.utm_campaign || null,
+          utm_term: utm.utm_term || null,
+          utm_content: utm.utm_content || null,
+          campaign_touches: hasUtm ? [{
+            at: when,
+            utm_source: utm.utm_source || null,
+            utm_medium: utm.utm_medium || null,
+            utm_campaign: utm.utm_campaign || null,
+            utm_term: utm.utm_term || null,
+            utm_content: utm.utm_content || null,
+            url: url || null,
+            referrer: referrer || null
+          }] : []
+        }
+      },
+      { upsert: true }
+    );
+    return sessionId;
+  }
+
+  // No provided session_id: try to attach to a recent session (actor-based), else create new
+  if (actor) {
+    const recent = await Session.findOne({ brand_id: brand, actor_id: actor })
+      .sort({ last_event_at: -1 }).lean();
+
+    if (recent && (when - new Date(recent.last_event_at) <= SESSION_TIMEOUT_MS)) {
+      await Session.updateOne(
+        { brand_id: brand, session_id: recent.session_id },
+        {
+          $max: { last_event_at: when },
+          ...(hasUtm ? {
+            $push: { campaign_touches: {
+              at: when,
+              utm_source: utm.utm_source || null,
+              utm_medium: utm.utm_medium || null,
+              utm_campaign: utm.utm_campaign || null,
+              utm_term: utm.utm_term || null,
+              utm_content: utm.utm_content || null,
+              url: url || null,
+              referrer: referrer || null
+            }}
+          } : {})
+        }
+      );
+      return recent.session_id;
+    }
+  }
+
+  // Create a fresh session id
+  const sid = crypto.randomUUID();
+  await Session.updateOne(
+    { brand_id: brand, session_id: sid },
+    {
+      $setOnInsert: {
+        brand_id: brand,
+        session_id: sid,
+        actor_id: actor || 'anon',
+        started_at: when,
+        last_event_at: when,
+        landing_url: url || null,
+        landing_referrer: referrer || null,
+        utm_source: utm.utm_source || null,
+        utm_medium: utm.utm_medium || null,
+        utm_campaign: utm.utm_campaign || null,
+        utm_term: utm.utm_term || null,
+        utm_content: utm.utm_content || null,
+        campaign_touches: hasUtm ? [{
+          at: when,
+          utm_source: utm.utm_source || null,
+          utm_medium: utm.utm_medium || null,
+          utm_campaign: utm.utm_campaign || null,
+          utm_term: utm.utm_term || null,
+          utm_content: utm.utm_content || null,
+          url: url || null,
+          referrer: referrer || null
+        }] : []
+      }
+    },
+    { upsert: true }
+  );
+  return sid;
+}
+
 // ---------- Routes ----------
 app.post('/collect', brandAuth, async (req, res) => {
   try {
@@ -250,7 +385,7 @@ app.post('/collect', brandAuth, async (req, res) => {
 
       const within10mOfStart = !!(recent && (when - new Date(recent.started_at) <= SPLIT_DEBOUNCE_MS));
 
-      // RULE IMPLEMENTATION:
+      // RULE:
       // 1) If PV arrives within 10 min of session start AND referrer class unchanged -> DO NOT split (even if UTM changed)
       const dontSplitWithin10SameSource = isPV && within10mOfStart && (refClassNow === prevRefClass);
 
@@ -260,8 +395,8 @@ app.post('/collect', brandAuth, async (req, res) => {
       const needNewSession =
         !hasRecent || !within30m || (sourceChanged && !dontSplitWithin10SameSource);
 
-      if (needNewSession) {
-        // NEW session; fresh UUID; session_sig prevents race double-creates
+      if (needNewSession && isPV) {
+        // NEW session from PV; session_sig prevents race double-creates
         const sig = makeSessionSig(when, e.url, e.referrer, utmNow);
         const base = { brand_id: req.brand, actor_id: actor, session_sig: sig };
 
@@ -303,32 +438,27 @@ app.post('/collect', brandAuth, async (req, res) => {
           sessionId = await upsertSessionWithNewId();
         } catch (err) {
           if (err?.code === 11000 && err?.keyPattern?.session_id) {
-            // extremely rare: retry once on session_id collision
             sessionId = await upsertSessionWithNewId();
           } else {
             throw err;
           }
         }
-      } else {
+      } else if (within30m && recent) {
         // CONTINUE existing session (no split)
         sessionId = sessionId || recent.session_id || deriveSid(req.brand, actor, when);
-
-        // Always advance last_event_at safely
         await Session.updateOne(
           { brand_id: req.brand, session_id: sessionId },
           {
             $max: { last_event_at: when },
-            // If the primary UTM fields are empty, set them from this landing
-            $set: {
-              ...(isPV ? {
+            ...(isPV ? {
+              $set: {
                 utm_source: recent?.utm_source ?? utmNow.utm_source ?? null,
                 utm_medium: recent?.utm_medium ?? utmNow.utm_medium ?? null,
                 utm_campaign: recent?.utm_campaign ?? utmNow.utm_campaign ?? null,
                 utm_term: recent?.utm_term ?? utmNow.utm_term ?? null,
                 utm_content: recent?.utm_content ?? utmNow.utm_content ?? null
-              } : {})
-            },
-            // Always append a campaign_touch entry when PV has any UTM signal
+              }
+            } : {}),
             ...(isPV && utmNowKey ? {
               $push: {
                 campaign_touches: {
@@ -345,12 +475,27 @@ app.post('/collect', brandAuth, async (req, res) => {
             } : {})
           }
         );
+      } else if (!isPV) {
+        // Non-PV event (e.g., ATC) with no attachable recent session.
+        // We'll handle session creation/patch in the ATC ensure step below if needed.
       }
     }
 
     // --- ATC write path (requires session + product) ---
     let productId = normalizeShopifyId(e?.data?.product_id ?? null);
     if (!productId) productId = synthPid(req.brand, sessionId, e);
+
+    // Ensure we have an appropriate session when ATC arrives (covers ATC-only flows)
+    if (e.event_name === 'product_added_to_cart') {
+      sessionId = await ensureSessionForATC({
+        brand: req.brand,
+        actor,
+        when,
+        url: e.url || null,
+        referrer: e.referrer || null,
+        sessionId: sessionId || null
+      });
+    }
 
     if (e.event_name === 'product_added_to_cart' && sessionId && productId) {
       await Event.updateOne(
@@ -414,6 +559,7 @@ app.get('/metrics/sessions', brandAuth, async (req, res) => {
   }
 });
 
+// Unique session-count + unique ATC-session-count for a time window
 app.get('/metrics/sessions/:timestamp', brandAuth, async (req, res) => {
   try {
     const { timestamp } = req.params;
@@ -438,7 +584,7 @@ app.get('/metrics/sessions/:timestamp', brandAuth, async (req, res) => {
       return res.status(400).json({ error: 'invalid to timestamp' });
     }
 
-    // Prepare both queries (but don't await yet)
+    // Prepare both queries (parallel)
     const sessionsPromise = Session.countDocuments({
       brand_id: req.brand,
       started_at: { $gt: ts, $lte: to }
@@ -457,9 +603,7 @@ app.get('/metrics/sessions/:timestamp', brandAuth, async (req, res) => {
       { $count: 'unique_atc_sessions' }
     ]);
 
-    // Run in parallel
     const [totalSessions, atcAgg] = await Promise.all([sessionsPromise, atcSessionsPromise]);
-
     const totalAtcSessions = atcAgg?.[0]?.unique_atc_sessions || 0;
 
     res.json({
@@ -468,14 +612,13 @@ app.get('/metrics/sessions/:timestamp', brandAuth, async (req, res) => {
       to,
       eventName,
       totalSessions,
-      totalEvents: totalAtcSessions
+      totalAtcSessions
     });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'internal' });
   }
 });
-
 
 app.get('/healthz', (_, res) => res.json({ ok: true }));
 
