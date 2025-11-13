@@ -47,7 +47,7 @@ const sessionSchema = new mongoose.Schema({
 }, { versionKey: false, collection: 'sessions' });
 
 sessionSchema.index({ actor_id: 1, last_event_at: -1 });
-sessionSchema.index({ last_event_at: 1 }, { expireAfterSeconds: 21600 }); // TTL 6h
+sessionSchema.index({ last_event_at: 1 }, { expireAfterSeconds: 129600 }); // TTL 36h
 sessionSchema.index({ brand_id: 1, started_at: 1 });
 sessionSchema.index({ brand_id: 1, actor_id: 1, last_event_at: -1 });
 sessionSchema.index(
@@ -81,7 +81,7 @@ eventSchema.index(
     }
   }
 );
-eventSchema.index({ occurred_at: 1 }, { expireAfterSeconds: 21600 }); // TTL 6h
+eventSchema.index({ occurred_at: 1 }, { expireAfterSeconds: 129600 }); // TTL 36h
 eventSchema.index({ brand_id: 1, event_name: 1, occurred_at: 1 });
 eventSchema.index({ brand_id: 1, session_id: 1, occurred_at: 1 });
 
