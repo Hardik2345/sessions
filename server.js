@@ -5,6 +5,7 @@ import mongoose from 'mongoose';
 import { z } from 'zod';
 import cors from 'cors';
 import crypto from 'crypto';
+import SlugCache from './slugCache.model.js';
 
 const app = express();
 app.use(helmet());
@@ -89,6 +90,24 @@ const Session = mongoose.model('Session', sessionSchema);
 const Event = mongoose.model('Event', eventSchema);
 
 // ---------- Validation ----------
+// small helper: extract product/collection slug from common Shopify URL patterns
+function parseShopifySlug(url) {
+  if (!url) return null;
+  try {
+    const u = new URL(url, 'http://x');
+    const p = u.pathname || '';
+    const prod = p.match(/\/products\/([a-zA-Z0-9\-_.]+)/);
+    if (prod) return { type: 'product', slug: prod[1] };
+    const coll = p.match(/\/collections\/([a-zA-Z0-9\-_.]+)/);
+    if (coll) return { type: 'collection', slug: coll[1] };
+    const handle = u.searchParams.get('handle');
+    if (handle) return { type: 'product', slug: handle };
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 const EventSchema = z.object({
   event_id: z.string(),
   event_name: z.string(),
@@ -99,7 +118,8 @@ const EventSchema = z.object({
   url: z.string().url().nullable(),
   referrer: z.string().nullable(),
   user_agent: z.string().nullable(),
-  data: z.any().optional()
+  data: z.any().optional(),
+  slug_info: z.any().optional()
 });
 
 // ---------- Helpers ----------
@@ -203,6 +223,8 @@ app.post('/collect', brandAuth, async (req, res) => {
       referrer: safe(req.body.referrer),
       user_agent: safe(req.body.user_agent)
     };
+    // attach parsed slug info (kept minimal) so it's available in validation/result
+    normalized.slug_info = parseShopifySlug(req.body.url);
     const e = EventSchema.parse(normalized);
 
     const when = new Date(e.occurred_at);
@@ -298,6 +320,20 @@ app.post('/collect', brandAuth, async (req, res) => {
           { $max: { last_event_at: when } }
         );
       }
+    }
+
+    // If this is a page view and we parsed a slug, consult slug_cache and inject product_id
+    try {
+      if (isPV && e.slug_info) {
+        const cacheId = `${req.brand}:${e.slug_info.type}:${e.slug_info.slug}`;
+        const cacheDoc = await SlugCache.findById(cacheId).lean().catch(() => null);
+        if (cacheDoc && cacheDoc.shopify_id) {
+          e.data = e.data || {};
+          e.data.product_id = normalizeShopifyId(cacheDoc.shopify_id) || e.data.product_id;
+        }
+      }
+    } catch (err) {
+      console.warn('slug_cache consult failed', err?.message || err);
     }
 
     // --- ATC write path (requires session + product) ---
