@@ -327,9 +327,17 @@ app.post('/collect', brandAuth, async (req, res) => {
       if (isPV && e.slug_info) {
         const cacheId = `${req.brand}:${e.slug_info.type}:${e.slug_info.slug}`;
         const cacheDoc = await SlugCache.findById(cacheId).lean().catch(() => null);
-        if (cacheDoc && cacheDoc.shopify_id) {
-          e.data = e.data || {};
-          e.data.product_id = normalizeShopifyId(cacheDoc.shopify_id) || e.data.product_id;
+        if (cacheDoc) {
+          if (cacheDoc.shopify_id) {
+            e.data = e.data || {};
+            e.data.product_id = normalizeShopifyId(cacheDoc.shopify_id) || e.data.product_id;
+            console.info(`[slug_cache] hit brand=${req.brand} type=${e.slug_info.type} slug=${e.slug_info.slug} shopify_id=${cacheDoc.shopify_id}`);
+          } else {
+            // Negative cache (explicitly resolved to null)
+            console.info(`[slug_cache] negative-cache brand=${req.brand} type=${e.slug_info.type} slug=${e.slug_info.slug}`);
+          }
+        } else {
+          console.debug(`[slug_cache] miss brand=${req.brand} type=${e.slug_info.type} slug=${e.slug_info.slug}`);
         }
       }
     } catch (err) {
