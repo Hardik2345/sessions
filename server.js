@@ -167,8 +167,8 @@ function normalizeShopifyId(id) {
 }
 
 // Identify synthetic fallback product IDs sent by the pixel
-// const isFallbackId = (id) =>
-//   typeof id === 'string' && id.startsWith('FALLBACK:');
+const isFallbackId = (id) =>
+  typeof id === 'string' && id.startsWith('FALLBACK:');
 
 // Fallback ONLY for continuing sessions without client session_id
 function deriveSid(brand, actor, when) {
@@ -382,9 +382,9 @@ app.post('/collect', brandAuth, async (req, res) => {
     // --- ATC write path (requires session + product) ---
     let productId = normalizeShopifyId(e?.data?.product_id ?? null);
     // // Treat fallback IDs as "not really resolved" and synthesize a deterministic ID instead
-    // if (!productId || isFallbackId(productId)) {
-    //   productId = synthPid(req.brand, sessionId, e);
-    // }
+    if (!productId || isFallbackId(productId)) {
+      productId = synthPid(req.brand, sessionId, e);
+    }
 
     if (e.event_name === 'product_added_to_cart' && sessionId && productId) {
       await Event.updateOne(
