@@ -215,9 +215,37 @@ function utmKey(utm) {
   return (a||b||c) ? `${a}|${b}|${c}` : null; // null = no campaign
 }
 
+// Build & log the document we will insert on first write
+function buildInsertDoc(brand, e, sessionId, when, productIdOverride) {
+  const baseRaw = e.data ?? null;
+  let raw;
+  if (productIdOverride) {
+    raw = { ...(baseRaw || {}), product_id: productIdOverride };
+  } else {
+    raw = baseRaw;
+  }
+
+  const doc = {
+    brand_id: brand,
+    event_id: e.event_id,
+    session_id: sessionId,
+    event_name: e.event_name,
+    occurred_at: when,
+    url: e.url || null,
+    referrer: e.referrer || null,
+    user_agent: e.user_agent || null,
+    client_id: e.client_id || null,
+    visitor_id: e.visitor_id || null,
+    raw
+  };
+
+  console.log('[event_insert]', JSON.stringify(doc, null, 2));
+  return doc;
+}
+
 // ---------- Routes ----------
 app.post('/collect', brandAuth, async (req, res) => {
-  // ---------- Debug logging of incoming payload (no functional change) ----------
+  // ---------- Log incoming payload ----------
   try {
     const { body, headers } = req;
     const safeHeaders = { ...headers };
@@ -225,7 +253,7 @@ app.post('/collect', brandAuth, async (req, res) => {
     if (safeHeaders['x-collector-key']) safeHeaders['x-collector-key'] = '[redacted]';
     if (safeHeaders['x-collector-keys']) safeHeaders['x-collector-keys'] = '[redacted]';
 
-    console.debug(
+    console.log(
       '[collector] incoming event:',
       JSON.stringify(
         {
@@ -237,8 +265,8 @@ app.post('/collect', brandAuth, async (req, res) => {
         2
       )
     );
-  } catch (logErr) {
-    console.warn('[collector] failed to log incoming event', logErr?.message || logErr);
+  } catch {
+    // ignore logging errors
   }
   // ---------------------------------------------------------------------------
 
@@ -254,13 +282,8 @@ app.post('/collect', brandAuth, async (req, res) => {
     };
     // attach parsed slug info (kept minimal) so it's available in validation/result
     normalized.slug_info = parseShopifySlug(req.body.url);
-    
-    const e = EventSchema.parse(normalized);
 
-    console.debug('[slug_debug]', {
-      url: e.url,
-      slug_info: e.slug_info
-    });
+    const e = EventSchema.parse(normalized);
 
     const when = new Date(e.occurred_at);
     if (isNaN(when.getTime())) return res.sendStatus(400);
@@ -362,73 +385,39 @@ app.post('/collect', brandAuth, async (req, res) => {
       if (isPV && e.slug_info) {
         const cacheId = `${req.brand}:${e.slug_info.type}:${e.slug_info.slug}`;
         const cacheDoc = await SlugCache.findById(cacheId).lean().catch(() => null);
-        if (cacheDoc) {
-          if (cacheDoc.shopify_id) {
-            e.data = e.data || {};
-            e.data.product_id = normalizeShopifyId(cacheDoc.shopify_id) || e.data.product_id;
-            console.info(`[slug_cache] hit brand=${req.brand} type=${e.slug_info.type} slug=${e.slug_info.slug} shopify_id=${cacheDoc.shopify_id}`);
-          } else {
-            // Negative cache (explicitly resolved to null)
-            console.info(`[slug_cache] negative-cache brand=${req.brand} type=${e.slug_info.type} slug=${e.slug_info.slug}`);
-          }
-        } else {
-          console.debug(`[slug_cache] miss brand=${req.brand} type=${e.slug_info.type} slug=${e.slug_info.slug}`);
+        if (cacheDoc && cacheDoc.shopify_id) {
+          e.data = e.data || {};
+          e.data.product_id = normalizeShopifyId(cacheDoc.shopify_id) || e.data.product_id;
         }
       }
-    } catch (err) {
-      console.warn('slug_cache consult failed', err?.message || err);
+    } catch {
+      // swallow slug_cache errors, do not affect pipeline
     }
 
     // --- ATC write path (requires session + product) ---
     let productId = normalizeShopifyId(e?.data?.product_id ?? null);
-    // // Treat fallback IDs as "not really resolved" and synthesize a deterministic ID instead
+    // Treat fallback IDs as "not really resolved" and synthesize a deterministic ID instead
     if (!productId || isFallbackId(productId)) {
       productId = synthPid(req.brand, sessionId, e);
     }
 
     if (e.event_name === 'product_added_to_cart' && sessionId && productId) {
+      const insertDoc = buildInsertDoc(req.brand, e, sessionId, when, productId);
+
       await Event.updateOne(
         { brand_id: req.brand, session_id: sessionId, event_name: e.event_name, "raw.product_id": productId },
-        {
-          $setOnInsert: {
-            brand_id: req.brand,
-            event_id: e.event_id,
-            session_id: sessionId,
-            event_name: e.event_name,
-            occurred_at: when,
-            url: e.url || null,
-            referrer: e.referrer || null,
-            user_agent: e.user_agent || null,
-            client_id: e.client_id || null,
-            visitor_id: e.visitor_id || null,
-            raw: { ...(e.data ?? {}), product_id: productId }
-          }
-        },
+        { $setOnInsert: insertDoc },
         { upsert: true }
       );
     } else {
       // generic idempotent event write
-      const eve=await Event.updateOne(
+      const insertDoc = buildInsertDoc(req.brand, e, sessionId, when, null);
+
+      await Event.updateOne(
         { event_id: e.event_id },
-        {
-          $setOnInsert: {
-            brand_id: req.brand,
-            event_id: e.event_id,
-            session_id: sessionId,
-            event_name: e.event_name,
-            occurred_at: when,
-            url: e.url || null,
-            referrer: e.referrer || null,
-            user_agent: e.user_agent || null,
-            client_id: e.client_id || null,
-            visitor_id: e.visitor_id || null,
-            raw: e.data ?? null
-          }
-        },
+        { $setOnInsert: insertDoc },
         { upsert: true }
       );
-      console.log("event data: ", e.data)
-
     }
 
     res.sendStatus(204);
