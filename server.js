@@ -12,7 +12,7 @@ app.use(helmet());
 app.use(express.json({ limit: '256kb' }));
 
 app.use(cors({
-  origin: true,  
+  origin: true,
   methods: ['POST', 'GET', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'X-Collector-Key', 'X-Brand'],
   maxAge: 86400
@@ -213,6 +213,31 @@ function utmKey(utm) {
 
 // ---------- Routes ----------
 app.post('/collect', brandAuth, async (req, res) => {
+  // ---------- Debug logging of incoming payload (no functional change) ----------
+  try {
+    const { body, headers } = req;
+    const safeHeaders = { ...headers };
+
+    if (safeHeaders['x-collector-key']) safeHeaders['x-collector-key'] = '[redacted]';
+    if (safeHeaders['x-collector-keys']) safeHeaders['x-collector-keys'] = '[redacted]';
+
+    console.debug(
+      '[collector] incoming event:',
+      JSON.stringify(
+        {
+          brand: req.brand || getHeader(req, 'X-Brand'),
+          headers: safeHeaders,
+          body
+        },
+        null,
+        2
+      )
+    );
+  } catch (logErr) {
+    console.warn('[collector] failed to log incoming event', logErr?.message || logErr);
+  }
+  // ---------------------------------------------------------------------------
+
   try {
     const normalized = {
       ...req.body,
@@ -464,7 +489,7 @@ app.get('/metrics/sessions/:timestamp', brandAuth, async (req, res) => {
       to,
       eventName,
       totalSessions,
-      totalEvents:totalAtcSessions
+      totalEvents: totalAtcSessions
     });
   } catch (e) {
     console.error(e);
