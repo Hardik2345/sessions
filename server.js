@@ -427,7 +427,8 @@ app.post('/collect', brandAuth, async (req, res) => {
         },
         { upsert: true }
       );
-      console.log(`Event recorded: event_id=${e.event_id}`, eve)
+      console.log("event data: ", e.data)
+
     }
 
     res.sendStatus(204);
