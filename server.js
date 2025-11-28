@@ -254,11 +254,13 @@ app.post('/collect', brandAuth, async (req, res) => {
     };
     // attach parsed slug info (kept minimal) so it's available in validation/result
     normalized.slug_info = parseShopifySlug(req.body.url);
+    
+    const e = EventSchema.parse(normalized);
+
     console.debug('[slug_debug]', {
       url: e.url,
       slug_info: e.slug_info
     });
-    const e = EventSchema.parse(normalized);
 
     const when = new Date(e.occurred_at);
     if (isNaN(when.getTime())) return res.sendStatus(400);
