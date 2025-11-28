@@ -408,7 +408,7 @@ app.post('/collect', brandAuth, async (req, res) => {
       );
     } else {
       // generic idempotent event write
-      await Event.updateOne(
+      const eve=await Event.updateOne(
         { event_id: e.event_id },
         {
           $setOnInsert: {
@@ -427,6 +427,7 @@ app.post('/collect', brandAuth, async (req, res) => {
         },
         { upsert: true }
       );
+      console.log(`Event recorded: event_id=${e.event_id}`, eve)
     }
 
     res.sendStatus(204);
