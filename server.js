@@ -58,7 +58,7 @@ sessionSchema.index(
 
 const eventSchema = new mongoose.Schema({
   brand_id: { type: String, required: true, index: true },
-  event_id: { type: String, required: true, unique: true },
+  event_id: { type: String, required: true },
   session_id: { type: String, index: true },
   event_name: { type: String, required: true, index: true },
   occurred_at: { type: Date, required: true },
@@ -72,6 +72,10 @@ const eventSchema = new mongoose.Schema({
 
 eventSchema.index({ session_id: 1, occurred_at: 1 });
 eventSchema.index(
+  { event_id: 1 },
+  { unique: true, partialFilterExpression: { event_id: { $type: "string" } } }
+);
+eventSchema.index(
   { brand_id: 1, session_id: 1, event_name: 1, "raw.product_id": 1 },
   {
     unique: true,
@@ -82,7 +86,7 @@ eventSchema.index(
     }
   }
 );
-eventSchema.index({ occurred_at: 1 }, { expireAfterSeconds: 129600 }); // TTL 36h
+eventSchema.index({ occurred_at: 1 }, { expireAfterSeconds: 2700 }); // TTL 45m
 eventSchema.index({ brand_id: 1, event_name: 1, occurred_at: 1 });
 eventSchema.index({ brand_id: 1, session_id: 1, occurred_at: 1 });
 
@@ -136,9 +140,15 @@ function pickAuth(req) {
 }
 function brandAuth(req, res, next) {
   const { brand, key } = pickAuth(req);
-  if (!brand) return res.status(400).json({ error: 'missing brand' });
+  if (!brand) {
+    console.warn('[auth] rejected: missing brand', { path: req.path, ip: req.ip });
+    return res.status(400).json({ error: 'missing brand' });
+  }
   const expected = KEY_MAP ? KEY_MAP[brand] : (COLLECTOR_KEY || null);
-  if (!expected || key !== expected) return res.sendStatus(401);
+  if (!expected || key !== expected) {
+    console.warn('[auth] rejected: bad key', { brand, path: req.path, ip: req.ip });
+    return res.sendStatus(401);
+  }
   req.brand = brand;
   next();
 }
