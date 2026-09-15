@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sessions — Shopify Storefront Event Collector</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1f2328;
+    --muted: #6b7280;
+    --border: #e2e5e9;
+    --code-bg: #f6f8fa;
+    --accent: #0969da;
+    --table-head: #f6f8fa;
+    --callout-bg: #fff8e6;
+    --callout-border: #f0c86a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117;
+      --fg: #e6edf3;
+      --muted: #9198a1;
+      --border: #30363d;
+      --code-bg: #161b22;
+      --accent: #4493f8;
+      --table-head: #161b22;
+      --callout-bg: #2b2412;
+      --callout-border: #6b5b1f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+  }
+  .wrap {
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 80px;
+  }
+  h1 {
+    font-size: 1.9rem;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 12px;
+    margin-bottom: 8px;
+  }
+  h2 {
+    font-size: 1.35rem;
+    margin-top: 2.2em;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 6px;
+  }
+  h3 { font-size: 1.1rem; margin-top: 1.6em; }
+  p, li { color: var(--fg); }
+  .subtitle { color: var(--muted); margin-top: 0; }
+  code {
+    background: var(--code-bg);
+    padding: 0.15em 0.4em;
+    border-radius: 4px;
+    font-size: 0.9em;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    overflow-x: auto;
+  }
+  pre code { background: none; padding: 0; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1em 0;
+    font-size: 0.95em;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: 8px 12px;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--table-head); }
+  blockquote {
+    background: var(--callout-bg);
+    border-left: 4px solid var(--callout-border);
+    margin: 1em 0;
+    padding: 10px 16px;
+    border-radius: 0 6px 6px 0;
+  }
+  blockquote p { margin: 0.3em 0; }
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 2.2em 0;
+  }
+  a { color: var(--accent); }
+  .flow {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.85em;
+    line-height: 1.5;
+    white-space: pre;
+    overflow-x: auto;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Sessions — Shopify Storefront Event Collector</h1>
+<p class="subtitle">A lightweight Node.js/Express service that collects visitor behavior events (page views, product views, add-to-cart, checkout starts, scroll depth, and clicks) from Shopify storefronts, stitches them into visitor sessions, and stores everything in MongoDB.</p>
+
+<blockquote>
+<p><strong>Note on the name:</strong> despite the folder being called "sessions," this is <strong>not</strong> a booking/appointment-scheduling app. "Session" here means a <em>website visit session</em> — the standard web-analytics concept of one continuous browsing visit by a single person.</p>
+</blockquote>
+
+<hr>
+
+<h2>1. What this service does</h2>
+<p>Shopify stores install a small tracking script (a "pixel") that watches what a visitor does — viewing pages, viewing products, adding items to cart, starting checkout, scrolling, and clicking. Every time one of those things happens, the pixel sends a small JSON message to this service's <code>/collect</code> endpoint. This service:</p>
+<ol>
+  <li>Verifies the request belongs to a known store ("brand").</li>
+  <li>Validates the shape of the event.</li>
+  <li>Figures out which ongoing visit ("session") the event belongs to.</li>
+  <li>For clicks, classifies whether it was a <strong>useful</strong> click (it did something) or a <strong>dead</strong> click (it did nothing).</li>
+  <li>Saves the event to MongoDB, avoiding duplicates.</li>
+</ol>
+<p>A separate, external service (in a different repository, not this one) periodically reads this data out of MongoDB and loads it into a MySQL reporting table. That worker is out of scope for this repo — this service's job ends at "reliably capture and store events in MongoDB."</p>
+
+<h2>2. High-level flow</h2>
+<div class="flow">Shopify storefront pixel
+        │
+        │  POST /collect  (X-Brand + X-Collector-Key headers)
+        ▼
+  Auth check (brandAuth)
+        ▼
+  Schema validation (Zod)
+        ▼
+  ┌─────────────────────────────┐
+  │ event_name === "click" ?    │
+  └─────────────────────────────┘
+     │ yes                  │ no
+     ▼                      ▼
+ Classify as           Session stitching
+ useful/dead click     (new session vs.
+     │                 continuing session)
+     ▼                      ▼
+ Save to               Slug → product ID
+ click_events           resolution (page views)
+ collection                  ▼
+                        Save to events
+                        collection
+                              │
+                              ▼
+                  ┌───────────────────────┐
+                  │  /metrics endpoints    │
+                  │  (session/ATC counts)  │
+                  └───────────────────────┘
+                              │
+                              ▼
+              External MySQL worker (separate repo,
+              reads from MongoDB on its own schedule)</div>
+
+<h2>3. Event types tracked</h2>
+<table>
+<thead><tr><th>Event name</th><th>What it captures</th><th>Special handling</th></tr></thead>
+<tbody>
+<tr><td><code>page_viewed</code></td><td>A storefront page load</td><td>The URL is parsed for a product/collection slug, which is looked up in a slug cache to attach a real Shopify product ID</td></tr>
+<tr><td><code>product_viewed</code></td><td>A visitor viewing a specific product</td><td>Product/variant details captured as-is</td></tr>
+<tr><td><code>product_added_to_cart</code></td><td>An add-to-cart action</td><td>Deduplicated per <code>(brand, session, product)</code> so repeat pixel fires for the same item don't double-count; the only event type aggregated by <code>/metrics/sessions/:timestamp</code></td></tr>
+<tr><td><code>checkout_started</code></td><td>A checkout beginning (native Shopify checkout or a third-party checkout accelerator like GoKwik)</td><td>Both checkout paths are normalized to the same <code>checkout_started</code> event name, with a <code>source</code> field noting which one fired</td></tr>
+<tr><td><code>scroll_depth</code></td><td>A visitor scrolling past a threshold (25%/50%/75%/100%) on a page</td><td>Published as a custom event from the storefront theme, forwarded by the pixel</td></tr>
+<tr><td><code>click</code></td><td>Any click on the page</td><td>The pixel watches what happens <em>after</em> the click and reports four true/false signals; the server uses those to classify the click (see below)</td></tr>
+</tbody>
+</table>
+<p>Any other event name is still accepted and stored generically (matched only by <code>event_id</code> for deduplication) — the server doesn't require a fixed list of event names.</p>
+
+<h2>4. Data model (MongoDB collections)</h2>
+<table>
+<thead><tr><th>Collection</th><th>Purpose</th><th>Retention (TTL)</th></tr></thead>
+<tbody>
+<tr><td><code>sessions</code></td><td>One document per visitor session — landing page, referrer, UTM parameters, first/last activity timestamps</td><td>36 hours</td></tr>
+<tr><td><code>events</code></td><td>All non-click events (page views, product views, add-to-cart, checkout starts, scroll depth)</td><td>45 minutes</td></tr>
+<tr><td><code>click_events</code></td><td>Every click event, with its classification (<code>useful_click</code> / <code>dead_click</code>)</td><td>45 minutes</td></tr>
+<tr><td><code>slug_cache</code></td><td>Maps a store's URL slugs to real Shopify product IDs, used to enrich <code>page_viewed</code> events</td><td>—</td></tr>
+<tr><td><code>slug_queue</code></td><td>A queue of slugs awaiting resolution — written for, and read by, the external slug-resolution worker (not part of this repo; currently unused by <code>server.js</code> itself)</td><td>—</td></tr>
+</tbody>
+</table>
+<p>Retention windows are intentionally short (45 min / 36h) because this service is a fast-moving ingestion buffer — the external MySQL worker is expected to read events out well before they expire.</p>
+<p>Every event is written with an idempotent "insert if not already present" pattern, keyed on the event's own <code>event_id</code>. That means if the same event is sent twice (a network retry, a double pixel fire), it's stored once, not duplicated. <code>product_added_to_cart</code> events additionally dedupe on <code>(brand, session, product)</code>, so the same product can't be double-counted as added-to-cart within the same session.</p>
+
+<h2>5. Useful click vs. dead click</h2>
+<p>Not every click does something — some just miss their target, or hit dead space. To separate signal from noise, the pixel watches for four outcomes after a click:</p>
+<ul>
+  <li><strong><code>url_changed</code></strong> — did the page navigate?</li>
+  <li><strong><code>cart_changed</code></strong> — did the cart contents change?</li>
+  <li><strong><code>ui_changed</code></strong> — did something visible on the page change (a modal opened, a menu expanded, etc.)?</li>
+  <li><strong><code>meaningful_scroll</code></strong> — did a real scroll happen as a result (e.g. jumping to a different section)?</li>
+</ul>
+<p>The pixel computes these four booleans itself and sends them along with the click. The server's job is simple: if <strong>any</strong> of the four are <code>true</code>, the click is classified <code>useful_click</code>; if <strong>all</strong> are <code>false</code>, it's a <code>dead_click</code>. This classification is stored directly on the click document for later analysis (e.g. "which buttons get clicked but do nothing").</p>
+
+<h2>6. Session stitching, in plain terms</h2>
+<p>A "session" groups together everything one visitor did in one continuous visit. The rules:</p>
+<ul>
+  <li>If a visitor hasn't been seen in the last <strong>30 minutes</strong>, their next event starts a <strong>new</strong> session.</li>
+  <li>If they're within that 30-minute window, the event is added to their <strong>existing</strong> session.</li>
+  <li><strong>Exception:</strong> even within 30 minutes, if a page view arrives with a meaningfully different traffic source (e.g. they left, came back from a different ad campaign or a different platform like Google vs. Facebook), the session is <strong>split</strong> — a new session starts, so campaign attribution doesn't get muddied by re-entries. This split rule is debounced (won't fire on rapid, likely-accidental source hops) and only considered on page views, not every event type.</li>
+</ul>
+
+<h2>7. API endpoints</h2>
+<table>
+<thead><tr><th>Endpoint</th><th>Method</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td><code>/collect</code></td><td>POST</td><td>Main ingestion endpoint. Requires <code>X-Brand</code> and <code>X-Collector-Key</code> headers (or <code>?brand=</code>/<code>?key=</code> query params). Accepts one event JSON body per call. Returns <code>204</code> on success, <code>400</code> on validation failure, <code>401</code> on bad auth.</td></tr>
+<tr><td><code>/metrics/sessions</code></td><td>GET</td><td>Returns a session count for a brand within a time range (<code>?from=</code>/<code>?to=</code>, defaults to the last 24h).</td></tr>
+<tr><td><code>/metrics/sessions/:timestamp</code></td><td>GET</td><td>Returns session count and unique add-to-cart-session count for a brand, from a given timestamp to now (or <code>?to=</code>).</td></tr>
+<tr><td><code>/healthz</code></td><td>GET</td><td>Basic health check, no auth required.</td></tr>
+</tbody>
+</table>
+
+<h2>8. Authentication</h2>
+<p>Every brand (Shopify store) using this pipeline has its own secret key. A request must include:</p>
+<ul>
+  <li><code>X-Brand</code>: the store's identifier (e.g. <code>pts_shop</code>)</li>
+  <li><code>X-Collector-Key</code>: that store's secret key</li>
+</ul>
+<p>These are checked against the <code>COLLECTOR_KEYS</code> environment variable, a JSON map of <code>brand → key</code>. If a brand isn't in that map, requests fall back to checking against a single shared <code>COLLECTOR_KEY</code> value instead — but in practice, every active brand should have its own entry in <code>COLLECTOR_KEYS</code>.</p>
+
+<h2>9. Environment variables</h2>
+<table>
+<thead><tr><th>Variable</th><th>Used for</th></tr></thead>
+<tbody>
+<tr><td><code>MONGO_URI</code></td><td>MongoDB connection string, including the database name (important: without an explicit database name in the URI, Mongo silently defaults to a database literally called <code>test</code>, which can collide with unrelated data — always include a dedicated database name)</td></tr>
+<tr><td><code>PORT</code></td><td>Port the server listens on</td></tr>
+<tr><td><code>COLLECTOR_KEY</code></td><td>Single fallback auth key, used only for brands not listed in <code>COLLECTOR_KEYS</code></td></tr>
+<tr><td><code>COLLECTOR_KEYS</code></td><td>JSON map of <code>brand → secret key</code>, the primary per-store authentication mechanism</td></tr>
+<tr><td><code>SHOPIFY_SHOPS</code></td><td>JSON map of brand → Shopify store domain/API token — present in <code>.env</code> but <strong>not currently read anywhere in <code>server.js</code></strong>; reserved for the external slug-resolution/MySQL worker</td></tr>
+<tr><td><code>WORKER_ENABLED</code></td><td>Present in <code>.env</code> but <strong>not currently read anywhere in <code>server.js</code></strong>; reserved for the external worker</td></tr>
+<tr><td><code>DEBUG_SESSIONS</code></td><td>Present in <code>.env</code>; currently unused by application logic</td></tr>
+</tbody>
+</table>
+
+<h2>10. Running locally &amp; deploying</h2>
+<pre><code>npm install
+npm run dev     # nodemon, auto-restarts on file changes
+# or
+npm start        # plain node</code></pre>
+<p>Both commands load environment variables from a local <code>.env</code> file via Node's built-in <code>--env-file</code> flag — no <code>dotenv</code> package is used.</p>
+<p><strong>Important deployment note:</strong> if this service is deployed on a platform like Render, that platform's environment variables are configured <strong>separately in its own dashboard</strong> — they are not automatically synced from the local <code>.env</code> file (which is git-ignored and never pushed). When updating secrets like <code>COLLECTOR_KEYS</code> or <code>MONGO_URI</code>, both places need to be updated in lockstep, or the deployed service will silently keep using stale values. This has been a real source of confusing bugs (e.g. a brand's key working locally but returning <code>401</code> in production).</p>
+<p>Also note: Render's dashboard treats environment variable values literally — unlike a <code>.env</code> file, it does <strong>not</strong> strip surrounding quote characters. Pasting a value that was copied straight out of a <code>.env</code> file (which may be wrapped in <code>'...'</code> for shell-quoting purposes) will include those quote characters in the actual value, breaking JSON parsing for variables like <code>COLLECTOR_KEYS</code>.</p>
+
+<h2>11. Things to know when working on this service</h2>
+<ul>
+  <li><strong>Deduplication is by <code>event_id</code></strong>, not by content — sending the exact same event twice with the same ID is safe; sending a logically duplicate event with a new ID will be stored twice.</li>
+  <li><strong>Data doesn't live long here on purpose</strong> — 45 minutes for events/clicks, 36 hours for sessions. This service is a buffer, not a permanent data store; downstream systems (the external MySQL worker) are expected to read data out promptly.</li>
+  <li><strong>Click events skip session stitching</strong> — unlike other events, a click's <code>session_id</code> is taken as-is from whatever the pixel already computed, without the server re-deriving/updating session state. This keeps high-volume click tracking lightweight.</li>
+  <li><strong>The MySQL ingestion worker lives in a different repository</strong> and is not part of this codebase — <code>slug_queue</code> and the <code>SHOPIFY_SHOPS</code>/<code>WORKER_ENABLED</code> env vars exist here only because this pipeline produces the data that worker consumes.</li>
+  <li><strong>The Shopify pixel script itself is also maintained separately</strong> (in the relevant Shopify store's admin, not in this repo) — this README documents the server side only.</li>
+</ul>
+
+</div>
+</body>
+</html>
