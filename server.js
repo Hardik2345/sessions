@@ -6,6 +6,7 @@ import { z } from 'zod';
 import cors from 'cors';
 import crypto from 'crypto';
 import SlugCache from './slugCache.model.js';
+import ClickEvent from './clickEvent.model.js';
 
 const app = express();
 app.use(helmet());
@@ -126,6 +127,40 @@ const EventSchema = z.object({
   slug_info: z.any().optional()
 });
 
+const ClickDataSchema = z.object({
+  x: z.number().nullable().default(null),
+  y: z.number().nullable().default(null),
+  tag_name: z.string().nullable().default(null),
+  element_id: z.string().nullable().default(null),
+  element_name: z.string().nullable().default(null),
+  element_type: z.string().nullable().default(null),
+  element_value: z.string().nullable().default(null),
+  href: z.string().nullable().default(null)
+});
+
+const ClickSignalsSchema = z.object({
+  url_changed: z.boolean(),
+  cart_changed: z.boolean(),
+  ui_changed: z.boolean(),
+  meaningful_scroll: z.boolean()
+});
+
+const ClickEventSchema = z.object({
+  event_id: z.string(),
+  event_name: z.literal('click'),
+  occurred_at: z.string(),
+  client_id: z.string().nullable(),
+  visitor_id: z.string().nullable(),
+  session_id: z.string().nullable(),
+  url: z.string().url().nullable(),
+  referrer: z.string().nullable(),
+  user_agent: z.string().nullable(),
+  data: z.object({
+    click: ClickDataSchema,
+    signals: ClickSignalsSchema
+  })
+});
+
 // ---------- Helpers ----------
 const safe = v => (v === undefined ? null : v);
 const hostOf = (u) => { try { return u ? new URL(u).host : null; } catch { return null; } };
@@ -225,6 +260,13 @@ function utmKey(utm) {
   return (a||b||c) ? `${a}|${b}|${c}` : null; // null = no campaign
 }
 
+// A click is "useful" if it produced any observable effect
+function classifyClick(signals) {
+  const s = signals || {};
+  const useful = !!(s.url_changed || s.cart_changed || s.ui_changed || s.meaningful_scroll);
+  return useful ? 'useful_click' : 'dead_click';
+}
+
 // Build & log the document we will insert on first write
 function buildInsertDoc(brand, e, sessionId, when, productIdOverride) {
   const baseRaw = e.data ?? null;
@@ -279,6 +321,48 @@ app.post('/collect', brandAuth, async (req, res) => {
     // ignore logging errors
   }
   // ---------------------------------------------------------------------------
+
+  if (req.body?.event_name === 'click') {
+    try {
+      const e = ClickEventSchema.parse(req.body);
+
+      const when = new Date(e.occurred_at);
+      if (isNaN(when.getTime())) return res.sendStatus(400);
+
+      const clickBucket = classifyClick(e.data.signals);
+
+      const doc = {
+        brand_id: req.brand,
+        event_id: e.event_id,
+        event_name: e.event_name,
+        occurred_at: when,
+        ingested_at: new Date(),
+        client_id: e.client_id || null,
+        visitor_id: e.visitor_id || null,
+        session_id: e.session_id || null,
+        url: e.url || null,
+        referrer: e.referrer || null,
+        user_agent: e.user_agent || null,
+        click: e.data.click,
+        signals: e.data.signals,
+        click_bucket: clickBucket,
+        raw: e
+      };
+
+      console.log('[click_event_insert]', JSON.stringify(doc, null, 2));
+
+      await ClickEvent.updateOne(
+        { event_id: e.event_id },
+        { $setOnInsert: doc },
+        { upsert: true }
+      );
+
+      return res.sendStatus(204);
+    } catch (err) {
+      console.error(err);
+      return res.sendStatus(400);
+    }
+  }
 
   try {
     const normalized = {
@@ -522,6 +606,7 @@ app.get('/healthz', (_, res) => res.json({ ok: true }));
   try {
     await Session.syncIndexes();
     await Event.syncIndexes();
+    await ClickEvent.syncIndexes();
   } catch (e) {
     console.warn('Index sync failed:', e?.message || e);
   }
