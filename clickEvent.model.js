@@ -40,6 +40,10 @@ const clickEventSchema = new mongoose.Schema({
 
   click_bucket: { type: String, required: true, enum: ['useful_click', 'dead_click'], index: true },
 
+  session_start: { type: Date, default: null },
+  session_end: { type: Date, default: null },
+  session_time_spent: { type: Number, default: null }, // milliseconds
+
   raw: { type: mongoose.Schema.Types.Mixed }
 }, { versionKey: false, collection: 'click_events', timestamps: true });
 

@@ -7,6 +7,7 @@ import cors from 'cors';
 import crypto from 'crypto';
 import SlugCache from './slugCache.model.js';
 import ClickEvent from './clickEvent.model.js';
+import ActorCursor from './actorCursor.model.js';
 
 const app = express();
 app.use(helmet());
@@ -25,10 +26,12 @@ const {
   MONGO_URI,
   PORT = 3000,
   COLLECTOR_KEY,
-  COLLECTOR_KEYS // JSON map: {"brandA":"keyA","brandB":"keyB"}
+  COLLECTOR_KEYS, // JSON map: {"brandA":"keyA","brandB":"keyB"}
+  SESSION_TIMEOUT = 1800 // seconds; default 30 min
 } = process.env;
 
 const KEY_MAP = (() => { try { return COLLECTOR_KEYS ? JSON.parse(COLLECTOR_KEYS) : null; } catch { return null; }})();
+const SESSION_TIMEOUT_MS = Number(SESSION_TIMEOUT) * 1000;
 
 // ---------- Schemas & Models ----------
 //
@@ -81,6 +84,9 @@ const eventSchema = new mongoose.Schema({
   user_agent: { type: String },
   client_id: { type: String, index: true },
   visitor_id: { type: String, index: true },
+  session_start: { type: Date, default: null },
+  session_end: { type: Date, default: null },
+  session_time_spent: { type: Number, default: null }, // milliseconds
   raw: { type: mongoose.Schema.Types.Mixed }
 }, { versionKey: false, collection: 'events', timestamps: true });
 
@@ -283,8 +289,68 @@ function classifyClick(signals) {
   return useful ? 'useful_click' : 'dead_click';
 }
 
+// ---------- Session timing (per-actor, across events + click_events) ----------
+// Decide this event's session_start/session_end/session_time_spent using a
+// tiny per-actor cursor (see actorCursor.model.js). session_time_spent is
+// always null for the event being processed right now — it only ever gets
+// filled in retroactively, on a session's actual last event, once a later
+// event reveals the session has closed (see commitSessionCursor below).
+async function resolveSessionTiming(brand, actorId, when) {
+  if (!actorId) {
+    return { session_start: when, session_end: null, session_time_spent: null, cursor: null, isNewSession: true };
+  }
+
+  const cursor = await ActorCursor.findOne({ brand_id: brand, actor_id: actorId }).lean();
+  const gap = cursor ? (when - new Date(cursor.last_event_at)) : Infinity;
+  const isNewSession = !cursor || gap > SESSION_TIMEOUT_MS || gap < 0;
+
+  if (isNewSession) {
+    return { session_start: when, session_end: null, session_time_spent: null, cursor, isNewSession: true };
+  }
+
+  return {
+    session_start: new Date(cursor.session_start),
+    session_end: when,
+    session_time_spent: null,
+    cursor,
+    isNewSession: false
+  };
+}
+
+// Only call this once the event has actually been newly inserted (not a
+// duplicate/no-op upsert) — otherwise a retried event_id would corrupt the
+// timeline or double-close a session.
+async function commitSessionCursor(brand, actorId, timing, when, docRef) {
+  if (!actorId) return;
+
+  if (timing.isNewSession && timing.cursor) {
+    const prevSessionStart = new Date(timing.cursor.session_start);
+    const prevLastEventAt = new Date(timing.cursor.last_event_at);
+    const PrevModel = timing.cursor.last_ref.collection === 'click_events' ? ClickEvent : Event;
+
+    try {
+      await PrevModel.updateOne(
+        { event_id: timing.cursor.last_ref.event_id },
+        { $set: { session_end: prevLastEventAt, session_time_spent: prevLastEventAt - prevSessionStart } }
+      );
+    } catch (err) {
+      console.error('[session] failed to close previous session:', err);
+    }
+  }
+
+  try {
+    await ActorCursor.updateOne(
+      { brand_id: brand, actor_id: actorId },
+      { $set: { session_start: timing.session_start, last_event_at: when, last_ref: docRef } },
+      { upsert: true }
+    );
+  } catch (err) {
+    console.error('[session] failed to update actor cursor:', err);
+  }
+}
+
 // Build & log the document we will insert on first write
-function buildInsertDoc(brand, e, sessionId, actorId, when, productIdOverride) {
+function buildInsertDoc(brand, e, sessionId, actorId, when, productIdOverride, timing) {
   const baseRaw = e.data ?? null;
   let raw;
   if (productIdOverride) {
@@ -305,6 +371,9 @@ function buildInsertDoc(brand, e, sessionId, actorId, when, productIdOverride) {
     user_agent: e.user_agent || null,
     client_id: e.client_id || null,
     visitor_id: e.visitor_id || null,
+    session_start: timing?.session_start ?? null,
+    session_end: timing?.session_end ?? null,
+    session_time_spent: timing?.session_time_spent ?? null,
     raw
   };
 
@@ -348,6 +417,7 @@ app.post('/collect', brandAuth, async (req, res) => {
 
       const actorId = e.actor_id || e.client_id || null;
       const clickBucket = classifyClick(e.data.signals);
+      const timing = await resolveSessionTiming(req.brand, actorId, when);
 
       const doc = {
         brand_id: req.brand,
@@ -359,6 +429,9 @@ app.post('/collect', brandAuth, async (req, res) => {
         visitor_id: e.visitor_id || null,
         session_id: e.session_id || null,
         actor_id: actorId,
+        session_start: timing.session_start,
+        session_end: timing.session_end,
+        session_time_spent: timing.session_time_spent,
         url: e.url || null,
         referrer: e.referrer || null,
         user_agent: e.user_agent || null,
@@ -370,11 +443,15 @@ app.post('/collect', brandAuth, async (req, res) => {
 
       console.log('[click_event_insert]', JSON.stringify(doc, null, 2));
 
-      await ClickEvent.updateOne(
+      const result = await ClickEvent.updateOne(
         { event_id: e.event_id },
         { $setOnInsert: doc },
         { upsert: true }
       );
+
+      if (result.upsertedCount > 0) {
+        await commitSessionCursor(req.brand, actorId, timing, when, { collection: 'click_events', event_id: e.event_id });
+      }
 
       return res.sendStatus(204);
     } catch (err) {
@@ -409,6 +486,7 @@ app.post('/collect', brandAuth, async (req, res) => {
     // the pixel manages on its own — see README for details).
     const sessionId = e.session_id || null;
     const actorId = e.actor_id || e.client_id || null;
+    const timing = await resolveSessionTiming(req.brand, actorId, when);
 
     // If this is a page view and we parsed a slug, consult slug_cache and inject product_id
     try {
@@ -431,23 +509,30 @@ app.post('/collect', brandAuth, async (req, res) => {
       productId = synthPid(req.brand, sessionId, e);
     }
 
-    if (e.event_name === 'product_added_to_cart' && sessionId && productId) {
-      const insertDoc = buildInsertDoc(req.brand, e, sessionId, actorId, when, productId);
+    let result;
+    let docRefEventId = e.event_id;
 
-      await Event.updateOne(
+    if (e.event_name === 'product_added_to_cart' && sessionId && productId) {
+      const insertDoc = buildInsertDoc(req.brand, e, sessionId, actorId, when, productId, timing);
+
+      result = await Event.updateOne(
         { brand_id: req.brand, session_id: sessionId, event_name: e.event_name, "raw.product_id": productId },
         { $setOnInsert: insertDoc },
         { upsert: true }
       );
     } else {
       // generic idempotent event write
-      const insertDoc = buildInsertDoc(req.brand, e, sessionId, actorId, when, null);
+      const insertDoc = buildInsertDoc(req.brand, e, sessionId, actorId, when, null, timing);
 
-      await Event.updateOne(
+      result = await Event.updateOne(
         { event_id: e.event_id },
         { $setOnInsert: insertDoc },
         { upsert: true }
       );
+    }
+
+    if (result.upsertedCount > 0) {
+      await commitSessionCursor(req.brand, actorId, timing, when, { collection: 'events', event_id: docRefEventId });
     }
 
     res.sendStatus(204);
@@ -550,6 +635,7 @@ app.get('/healthz', (_, res) => res.json({ ok: true }));
     // await Session.syncIndexes(); // disabled, see note above
     await Event.syncIndexes();
     await ClickEvent.syncIndexes();
+    await ActorCursor.syncIndexes();
   } catch (e) {
     console.warn('Index sync failed:', e?.message || e);
   }
