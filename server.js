@@ -82,7 +82,7 @@ const eventSchema = new mongoose.Schema({
   client_id: { type: String, index: true },
   visitor_id: { type: String, index: true },
   raw: { type: mongoose.Schema.Types.Mixed }
-}, { versionKey: false, collection: 'events' });
+}, { versionKey: false, collection: 'events', timestamps: true });
 
 eventSchema.index({ session_id: 1, occurred_at: 1 });
 eventSchema.index(

@@ -41,7 +41,7 @@ const clickEventSchema = new mongoose.Schema({
   click_bucket: { type: String, required: true, enum: ['useful_click', 'dead_click'], index: true },
 
   raw: { type: mongoose.Schema.Types.Mixed }
-}, { versionKey: false, collection: 'click_events' });
+}, { versionKey: false, collection: 'click_events', timestamps: true });
 
 clickEventSchema.index(
   { event_id: 1 },
