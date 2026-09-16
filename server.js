@@ -290,14 +290,18 @@ function classifyClick(signals) {
 }
 
 // ---------- Session timing (per-actor, across events + click_events) ----------
-// Decide this event's session_start/session_end/session_time_spent using a
-// tiny per-actor cursor (see actorCursor.model.js). session_time_spent is
-// always null for the event being processed right now — it only ever gets
-// filled in retroactively, on a session's actual last event, once a later
-// event reveals the session has closed (see commitSessionCursor below).
+// Decide this event's session_id/session_start/session_end/session_time_spent
+// using a tiny per-actor cursor (see actorCursor.model.js). session_id is
+// server-generated (not trusted from the pixel) and follows the same
+// SESSION_TIMEOUT window as session_start/session_end — a new session_id is
+// minted whenever a new session starts, and reused for as long as the actor
+// keeps sending events within the timeout. session_time_spent is always null
+// for the event being processed right now — it only ever gets filled in
+// retroactively, on a session's actual last event, once a later event
+// reveals the session has closed (see commitSessionCursor below).
 async function resolveSessionTiming(brand, actorId, when) {
   if (!actorId) {
-    return { session_start: when, session_end: null, session_time_spent: null, cursor: null, isNewSession: true };
+    return { session_id: crypto.randomUUID(), session_start: when, session_end: null, session_time_spent: null, cursor: null, isNewSession: true };
   }
 
   const cursor = await ActorCursor.findOne({ brand_id: brand, actor_id: actorId }).lean();
@@ -305,10 +309,11 @@ async function resolveSessionTiming(brand, actorId, when) {
   const isNewSession = !cursor || gap > SESSION_TIMEOUT_MS || gap < 0;
 
   if (isNewSession) {
-    return { session_start: when, session_end: null, session_time_spent: null, cursor, isNewSession: true };
+    return { session_id: crypto.randomUUID(), session_start: when, session_end: null, session_time_spent: null, cursor, isNewSession: true };
   }
 
   return {
+    session_id: cursor.session_id,
     session_start: new Date(cursor.session_start),
     session_end: when,
     session_time_spent: null,
@@ -320,7 +325,7 @@ async function resolveSessionTiming(brand, actorId, when) {
 // Only call this once the event has actually been newly inserted (not a
 // duplicate/no-op upsert) — otherwise a retried event_id would corrupt the
 // timeline or double-close a session.
-async function commitSessionCursor(brand, actorId, timing, when, docRef) {
+async function commitSessionCursor(brand, actorId, timing, when, docRef, eventName) {
   if (!actorId) return;
 
   if (timing.isNewSession && timing.cursor) {
@@ -338,10 +343,21 @@ async function commitSessionCursor(brand, actorId, timing, when, docRef) {
     }
   }
 
+  // events_seq tracks the CURRENT (still-open) session's journey only —
+  // resets on a new session, otherwise appends the next step.
+  let eventsSeq;
+  if (timing.isNewSession) {
+    eventsSeq = { '1': eventName };
+  } else {
+    const prevSeq = timing.cursor?.events_seq || {};
+    const nextKey = String(Object.keys(prevSeq).length + 1);
+    eventsSeq = { ...prevSeq, [nextKey]: eventName };
+  }
+
   try {
     await ActorCursor.updateOne(
       { brand_id: brand, actor_id: actorId },
-      { $set: { session_start: timing.session_start, last_event_at: when, last_ref: docRef } },
+      { $set: { session_id: timing.session_id, session_start: timing.session_start, last_event_at: when, last_ref: docRef, events_seq: eventsSeq } },
       { upsert: true }
     );
   } catch (err) {
@@ -427,7 +443,7 @@ app.post('/collect', brandAuth, async (req, res) => {
         ingested_at: new Date(),
         client_id: e.client_id || null,
         visitor_id: e.visitor_id || null,
-        session_id: e.session_id || null,
+        session_id: timing.session_id,
         actor_id: actorId,
         session_start: timing.session_start,
         session_end: timing.session_end,
@@ -450,7 +466,7 @@ app.post('/collect', brandAuth, async (req, res) => {
       );
 
       if (result.upsertedCount > 0) {
-        await commitSessionCursor(req.brand, actorId, timing, when, { collection: 'click_events', event_id: e.event_id });
+        await commitSessionCursor(req.brand, actorId, timing, when, { collection: 'click_events', event_id: e.event_id }, e.event_name);
       }
 
       return res.sendStatus(204);
@@ -481,12 +497,14 @@ app.post('/collect', brandAuth, async (req, res) => {
 
     const isPV = e.event_name === 'page_viewed';
 
-    // No server-side session stitching: trust whatever session_id/actor_id
-    // the pixel already computed (actor_id is a persistent, ~1-year cookie
-    // the pixel manages on its own — see README for details).
-    const sessionId = e.session_id || null;
+    // actor_id is a persistent, ~1-year cookie the pixel manages on its own
+    // (see README for details) — trusted as-is, falling back to client_id.
+    // session_id, however, is server-generated: resolveSessionTiming mints
+    // a fresh one whenever a new session starts (per SESSION_TIMEOUT) and
+    // reuses it while the actor keeps sending events within that window.
     const actorId = e.actor_id || e.client_id || null;
     const timing = await resolveSessionTiming(req.brand, actorId, when);
+    const sessionId = timing.session_id;
 
     // If this is a page view and we parsed a slug, consult slug_cache and inject product_id
     try {
@@ -532,7 +550,7 @@ app.post('/collect', brandAuth, async (req, res) => {
     }
 
     if (result.upsertedCount > 0) {
-      await commitSessionCursor(req.brand, actorId, timing, when, { collection: 'events', event_id: docRefEventId });
+      await commitSessionCursor(req.brand, actorId, timing, when, { collection: 'events', event_id: docRefEventId }, e.event_name);
     }
 
     res.sendStatus(204);
