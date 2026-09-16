@@ -8,6 +8,7 @@ import crypto from 'crypto';
 import SlugCache from './slugCache.model.js';
 import ClickEvent from './clickEvent.model.js';
 import ActorCursor from './actorCursor.model.js';
+import SessionHistory from './sessionHistory.model.js';
 
 const app = express();
 app.use(helmet());
@@ -331,15 +332,34 @@ async function commitSessionCursor(brand, actorId, timing, when, docRef, eventNa
   if (timing.isNewSession && timing.cursor) {
     const prevSessionStart = new Date(timing.cursor.session_start);
     const prevLastEventAt = new Date(timing.cursor.last_event_at);
+    const prevSessionTimeSpent = prevLastEventAt - prevSessionStart;
     const PrevModel = timing.cursor.last_ref.collection === 'click_events' ? ClickEvent : Event;
 
     try {
       await PrevModel.updateOne(
         { event_id: timing.cursor.last_ref.event_id },
-        { $set: { session_end: prevLastEventAt, session_time_spent: prevLastEventAt - prevSessionStart } }
+        { $set: { session_end: prevLastEventAt, session_time_spent: prevSessionTimeSpent } }
       );
     } catch (err) {
       console.error('[session] failed to close previous session:', err);
+    }
+
+    // Permanent historical record of the just-closed session — actor_cursors
+    // itself is about to be overwritten with the new session's state below,
+    // so this is the only place the completed session's events_seq survives.
+    try {
+      await SessionHistory.create({
+        brand_id: brand,
+        actor_id: actorId,
+        session_id: timing.cursor.session_id,
+        session_start: prevSessionStart,
+        session_end: prevLastEventAt,
+        session_time_spent: prevSessionTimeSpent,
+        events_seq: timing.cursor.events_seq || {},
+        last_ref: timing.cursor.last_ref
+      });
+    } catch (err) {
+      console.error('[session] failed to write session history:', err);
     }
   }
 
@@ -654,6 +674,7 @@ app.get('/healthz', (_, res) => res.json({ ok: true }));
     await Event.syncIndexes();
     await ClickEvent.syncIndexes();
     await ActorCursor.syncIndexes();
+    await SessionHistory.syncIndexes();
   } catch (e) {
     console.warn('Index sync failed:', e?.message || e);
   }
