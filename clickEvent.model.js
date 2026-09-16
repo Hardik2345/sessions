@@ -29,6 +29,7 @@ const clickEventSchema = new mongoose.Schema({
   client_id: { type: String, default: null, index: true },
   visitor_id: { type: String, default: null, index: true },
   session_id: { type: String, default: null, index: true },
+  actor_id: { type: String, default: null, index: true },
 
   url: { type: String, default: null },
   referrer: { type: String, default: null },
@@ -50,6 +51,7 @@ clickEventSchema.index({ occurred_at: 1 }, { expireAfterSeconds: 2700 }); // TTL
 clickEventSchema.index({ brand_id: 1, occurred_at: 1 });
 clickEventSchema.index({ session_id: 1, occurred_at: 1 });
 clickEventSchema.index({ client_id: 1, occurred_at: 1 });
+clickEventSchema.index({ brand_id: 1, actor_id: 1, occurred_at: 1 });
 clickEventSchema.index({ click_bucket: 1, occurred_at: 1 });
 
 export default mongoose.models.ClickEvent || mongoose.model('ClickEvent', clickEventSchema);
