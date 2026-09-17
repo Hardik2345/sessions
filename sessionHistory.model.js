@@ -16,6 +16,11 @@ const sessionHistorySchema = new mongoose.Schema({
   session_end: { type: Date, required: true },
   session_time_spent: { type: Number, required: true }, // milliseconds
 
+  // session_end converted to the store's local timezone for display —
+  // mirrors how individual events' occurred_at field works. session_end
+  // itself stays true UTC for correctness (session-gap math, ordering).
+  occurred_at: { type: Date, required: true },
+
   events_seq: { type: mongoose.Schema.Types.Mixed, default: {} },
 
   last_ref: {

@@ -438,6 +438,9 @@ async function commitSessionCursor(brand, actorId, timing, when, docRef, eventDo
     // itself is about to be overwritten with the new session's state below,
     // so this is the only place the completed session's events_seq survives.
     try {
+      const ianaTz = getBrandCredentials(brand)?.store_timezone_iana;
+      const displayOccurredAt = toStoreLocalOccurredAt(prevLastEventAt, ianaTz);
+
       await SessionHistory.create({
         brand_id: brand,
         actor_id: actorId,
@@ -445,6 +448,7 @@ async function commitSessionCursor(brand, actorId, timing, when, docRef, eventDo
         session_start: prevSessionStart,
         session_end: prevLastEventAt,
         session_time_spent: prevSessionTimeSpent,
+        occurred_at: displayOccurredAt,
         events_seq: timing.cursor.events_seq || {},
         last_ref: timing.cursor.last_ref
       });
