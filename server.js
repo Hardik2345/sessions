@@ -326,7 +326,7 @@ async function resolveSessionTiming(brand, actorId, when) {
 // Only call this once the event has actually been newly inserted (not a
 // duplicate/no-op upsert) — otherwise a retried event_id would corrupt the
 // timeline or double-close a session.
-async function commitSessionCursor(brand, actorId, timing, when, docRef, eventName) {
+async function commitSessionCursor(brand, actorId, timing, when, docRef, eventDoc) {
   if (!actorId) return;
 
   if (timing.isNewSession && timing.cursor) {
@@ -364,14 +364,15 @@ async function commitSessionCursor(brand, actorId, timing, when, docRef, eventNa
   }
 
   // events_seq tracks the CURRENT (still-open) session's journey only —
-  // resets on a new session, otherwise appends the next step.
+  // resets on a new session, otherwise appends the next step. Stores the
+  // full event document (not just its name) for each step.
   let eventsSeq;
   if (timing.isNewSession) {
-    eventsSeq = { '1': eventName };
+    eventsSeq = { '1': eventDoc };
   } else {
     const prevSeq = timing.cursor?.events_seq || {};
     const nextKey = String(Object.keys(prevSeq).length + 1);
-    eventsSeq = { ...prevSeq, [nextKey]: eventName };
+    eventsSeq = { ...prevSeq, [nextKey]: eventDoc };
   }
 
   try {
@@ -486,7 +487,7 @@ app.post('/collect', brandAuth, async (req, res) => {
       );
 
       if (result.upsertedCount > 0) {
-        await commitSessionCursor(req.brand, actorId, timing, when, { collection: 'click_events', event_id: e.event_id }, e.event_name);
+        await commitSessionCursor(req.brand, actorId, timing, when, { collection: 'click_events', event_id: e.event_id }, doc);
       }
 
       return res.sendStatus(204);
@@ -549,9 +550,10 @@ app.post('/collect', brandAuth, async (req, res) => {
 
     let result;
     let docRefEventId = e.event_id;
+    let insertDoc;
 
     if (e.event_name === 'product_added_to_cart' && sessionId && productId) {
-      const insertDoc = buildInsertDoc(req.brand, e, sessionId, actorId, when, productId, timing);
+      insertDoc = buildInsertDoc(req.brand, e, sessionId, actorId, when, productId, timing);
 
       result = await Event.updateOne(
         { brand_id: req.brand, session_id: sessionId, event_name: e.event_name, "raw.product_id": productId },
@@ -560,7 +562,7 @@ app.post('/collect', brandAuth, async (req, res) => {
       );
     } else {
       // generic idempotent event write
-      const insertDoc = buildInsertDoc(req.brand, e, sessionId, actorId, when, null, timing);
+      insertDoc = buildInsertDoc(req.brand, e, sessionId, actorId, when, null, timing);
 
       result = await Event.updateOne(
         { event_id: e.event_id },
@@ -570,7 +572,7 @@ app.post('/collect', brandAuth, async (req, res) => {
     }
 
     if (result.upsertedCount > 0) {
-      await commitSessionCursor(req.brand, actorId, timing, when, { collection: 'events', event_id: docRefEventId }, e.event_name);
+      await commitSessionCursor(req.brand, actorId, timing, when, { collection: 'events', event_id: docRefEventId }, insertDoc);
     }
 
     res.sendStatus(204);
