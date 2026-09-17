@@ -51,7 +51,11 @@ clickEventSchema.index(
   { event_id: 1 },
   { unique: true, partialFilterExpression: { event_id: { $type: 'string' } } }
 );
-clickEventSchema.index({ occurred_at: 1 }, { expireAfterSeconds: 2700 }); // TTL 45m
+// TTL index intentionally not declared here — managed manually. If it's
+// created directly in MongoDB (not through this schema), see the note above
+// the bootstrap's syncIndexes() calls: syncIndexes() drops any index that
+// exists in the DB but isn't declared in the schema, so a manually-added
+// TTL index could get removed on the next deploy unless that's accounted for.
 clickEventSchema.index({ brand_id: 1, occurred_at: 1 });
 clickEventSchema.index({ session_id: 1, occurred_at: 1 });
 clickEventSchema.index({ client_id: 1, occurred_at: 1 });

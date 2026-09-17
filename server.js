@@ -9,6 +9,7 @@ import SlugCache from './slugCache.model.js';
 import ClickEvent from './clickEvent.model.js';
 import ActorCursor from './actorCursor.model.js';
 import SessionHistory from './sessionHistory.model.js';
+import { getBrandCredentials, refreshBrandCredentials } from './brandCredentials.js';
 
 const app = express();
 app.use(helmet());
@@ -26,13 +27,33 @@ app.options('/collect', cors());
 const {
   MONGO_URI,
   PORT = 3000,
-  COLLECTOR_KEY,
-  COLLECTOR_KEYS, // JSON map: {"brandA":"keyA","brandB":"keyB"}
   SESSION_TIMEOUT = 1800 // seconds; default 30 min
 } = process.env;
 
-const KEY_MAP = (() => { try { return COLLECTOR_KEYS ? JSON.parse(COLLECTOR_KEYS) : null; } catch { return null; }})();
 const SESSION_TIMEOUT_MS = Number(SESSION_TIMEOUT) * 1000;
+
+// Schedule brand-credential refreshes for the start of each day (server's
+// local time — on Render this is UTC unless configured otherwise), rather
+// than a fixed interval from whenever the process happened to start.
+// Recomputes "next midnight" fresh each time so day-length changes (DST)
+// don't cause drift.
+function msUntilNextMidnight() {
+  const now = new Date();
+  const next = new Date(now);
+  next.setHours(24, 0, 0, 0);
+  return next.getTime() - now.getTime();
+}
+
+function scheduleDailyBrandRefresh() {
+  setTimeout(async () => {
+    try {
+      await refreshBrandCredentials();
+    } catch (err) {
+      console.error('[brandCredentials] scheduled daily refresh failed, keeping last-known-good cache:', err.message);
+    }
+    scheduleDailyBrandRefresh();
+  }, msUntilNextMidnight());
+}
 
 // Two events belonging to the same page load/action can legitimately arrive
 // at the server out of order relative to their own client-side timestamps
@@ -137,7 +158,11 @@ eventSchema.index(
     }
   }
 );
-eventSchema.index({ occurred_at: 1 }, { expireAfterSeconds: 2700 }); // TTL 45m
+// TTL index intentionally not declared here — managed manually. If it's
+// created directly in MongoDB (not through this schema), see the note above
+// the bootstrap's syncIndexes() calls: syncIndexes() drops any index that
+// exists in the DB but isn't declared in the schema, so a manually-added
+// TTL index could get removed on the next deploy unless that's accounted for.
 eventSchema.index({ brand_id: 1, event_name: 1, occurred_at: 1 });
 eventSchema.index({ brand_id: 1, session_id: 1, occurred_at: 1 });
 eventSchema.index({ brand_id: 1, actor_id: 1, occurred_at: 1 });
@@ -230,12 +255,14 @@ function brandAuth(req, res, next) {
     console.warn('[auth] rejected: missing brand', { path: req.path, ip: req.ip });
     return res.status(400).json({ error: 'missing brand' });
   }
-  const expected = KEY_MAP ? KEY_MAP[brand] : (COLLECTOR_KEY || null);
+  const creds = getBrandCredentials(brand);
+  const expected = creds ? creds.intent_tracking_token : null;
   if (!expected || key !== expected) {
     console.warn('[auth] rejected: bad key', { brand, path: req.path, ip: req.ip });
     return res.sendStatus(401);
   }
   req.brand = brand;
+  req.brandCreds = creds;
   next();
 }
 
@@ -312,6 +339,35 @@ function synthPid(brand, sessionId, e) {
 //   const c = (utm.utm_campaign||'').trim().toLowerCase();
 //   return (a||b||c) ? `${a}|${b}|${c}` : null; // null = no campaign
 // }
+
+// Reinterprets a real UTC instant's wall-clock time in the store's timezone
+// as if it were UTC — i.e. bakes the store's local time into the Date value
+// purely for display purposes on the `occurred_at` field. All internal logic
+// (session-gap math, the actor cursor, TTL indexes) must keep using the true
+// instant (`when`), never this transformed value, or their math breaks.
+function toStoreLocalOccurredAt(date, ianaTimezone) {
+  if (!ianaTimezone) return date;
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: ianaTimezone,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      hour12: false
+    }).formatToParts(date);
+    const get = (type) => parts.find(p => p.type === type)?.value;
+    const year = Number(get('year'));
+    const month = Number(get('month'));
+    const day = Number(get('day'));
+    let hour = Number(get('hour'));
+    if (hour === 24) hour = 0; // some locales report midnight as 24
+    const minute = Number(get('minute'));
+    const second = Number(get('second'));
+    return new Date(Date.UTC(year, month - 1, day, hour, minute, second, date.getUTCMilliseconds()));
+  } catch (err) {
+    console.error('[timezone] failed to convert occurred_at for timezone', ianaTimezone, err.message);
+    return date;
+  }
+}
 
 // A click is "useful" if it produced any observable effect
 function classifyClick(signals) {
@@ -435,7 +491,7 @@ async function commitSessionCursor(brand, actorId, timing, when, docRef, eventDo
 }
 
 // Build & log the document we will insert on first write
-function buildInsertDoc(brand, e, sessionId, actorId, when, productIdOverride, timing) {
+function buildInsertDoc(brand, e, sessionId, actorId, when, productIdOverride, timing, displayOccurredAt) {
   const baseRaw = e.data ?? null;
   let raw;
   if (productIdOverride) {
@@ -450,7 +506,7 @@ function buildInsertDoc(brand, e, sessionId, actorId, when, productIdOverride, t
     session_id: sessionId,
     actor_id: actorId,
     event_name: e.event_name,
-    occurred_at: when,
+    occurred_at: displayOccurredAt ?? when,
     url: e.url || null,
     referrer: e.referrer || null,
     user_agent: e.user_agent || null,
@@ -505,12 +561,13 @@ app.post('/collect', brandAuth, async (req, res) => {
 
       const runInsert = async () => {
         const timing = await resolveSessionTiming(req.brand, actorId, when);
+        const displayOccurredAt = toStoreLocalOccurredAt(when, req.brandCreds?.store_timezone_iana);
 
         const doc = {
           brand_id: req.brand,
           event_id: e.event_id,
           event_name: e.event_name,
-          occurred_at: when,
+          occurred_at: displayOccurredAt,
           ingested_at: new Date(),
           client_id: e.client_id || null,
           visitor_id: e.visitor_id || null,
@@ -587,6 +644,7 @@ app.post('/collect', brandAuth, async (req, res) => {
     const runInsert = async () => {
       const timing = await resolveSessionTiming(req.brand, actorId, when);
       const sessionId = timing.session_id;
+      const displayOccurredAt = toStoreLocalOccurredAt(when, req.brandCreds?.store_timezone_iana);
 
       // If this is a page view and we parsed a slug, consult slug_cache and inject product_id
       try {
@@ -614,7 +672,7 @@ app.post('/collect', brandAuth, async (req, res) => {
       let insertDoc;
 
       if (e.event_name === 'product_added_to_cart' && sessionId && productId) {
-        insertDoc = buildInsertDoc(req.brand, e, sessionId, actorId, when, productId, timing);
+        insertDoc = buildInsertDoc(req.brand, e, sessionId, actorId, when, productId, timing, displayOccurredAt);
 
         result = await Event.updateOne(
           { brand_id: req.brand, session_id: sessionId, event_name: e.event_name, "raw.product_id": productId },
@@ -623,7 +681,7 @@ app.post('/collect', brandAuth, async (req, res) => {
         );
       } else {
         // generic idempotent event write
-        insertDoc = buildInsertDoc(req.brand, e, sessionId, actorId, when, null, timing);
+        insertDoc = buildInsertDoc(req.brand, e, sessionId, actorId, when, null, timing, displayOccurredAt);
 
         result = await Event.updateOne(
           { event_id: e.event_id },
@@ -737,11 +795,21 @@ app.get('/healthz', (_, res) => res.json({ ok: true }));
 
 // ---------- Bootstrap ----------
 (async () => {
+  // Fail loudly on startup if brand credentials can't be loaded at all —
+  // no brands loaded means no request could ever authenticate anyway.
+  await refreshBrandCredentials();
+  scheduleDailyBrandRefresh();
+
   await mongoose.connect(MONGO_URI, {
     serverSelectionTimeoutMS: 10000,
     maxPoolSize: 10
   });
   try {
+    // Note: syncIndexes() drops any index that exists on the collection but
+    // isn't declared in the schema above. The events/click_events TTL index
+    // is deliberately NOT declared here (added/managed manually instead) —
+    // if it's created directly in MongoDB, that's fine, syncIndexes() won't
+    // touch it as long as it stays undeclared in these schemas.
     // await Session.syncIndexes(); // disabled, see note above
     await Event.syncIndexes();
     await ClickEvent.syncIndexes();
