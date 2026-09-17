@@ -34,6 +34,36 @@ const {
 const KEY_MAP = (() => { try { return COLLECTOR_KEYS ? JSON.parse(COLLECTOR_KEYS) : null; } catch { return null; }})();
 const SESSION_TIMEOUT_MS = Number(SESSION_TIMEOUT) * 1000;
 
+// Two events belonging to the same page load/action can legitimately arrive
+// at the server out of order relative to their own client-side timestamps
+// (normal network/scheduling jitter — not a bug in the pixel). A small
+// negative gap is tolerated as "still the same session" instead of forcing
+// an incorrect split; anything beyond this is treated as a genuinely
+// out-of-order event and still starts a new session (see resolveSessionTiming).
+const NEGATIVE_GAP_TOLERANCE_MS = 30 * 1000;
+
+// ---------- Per-actor async lock ----------
+// resolveSessionTiming (read the cursor) and commitSessionCursor (write it)
+// are two separate operations. Without this, two /collect requests for the
+// SAME actor arriving within milliseconds of each other (very common — a
+// single page load often fires several analytics events almost
+// simultaneously) can race: both read the cursor before either writes back,
+// and whichever writes last can silently clobber the other's update
+// (lost events_seq entries, incorrect session_start, etc). This serializes
+// the read-decide-write-close cycle per actor so that can't happen.
+const actorLocks = new Map(); // key: "brand|actor_id" -> tail promise (never rejects)
+
+function withActorLock(key, fn) {
+  const prevTail = actorLocks.get(key) || Promise.resolve();
+  const result = prevTail.then(fn);
+  const tail = result.then(() => {}, () => {});
+  actorLocks.set(key, tail);
+  tail.finally(() => {
+    if (actorLocks.get(key) === tail) actorLocks.delete(key);
+  });
+  return result;
+}
+
 // ---------- Schemas & Models ----------
 //
 // DISABLED: server-side session persistence/stitching.
@@ -307,7 +337,11 @@ async function resolveSessionTiming(brand, actorId, when) {
 
   const cursor = await ActorCursor.findOne({ brand_id: brand, actor_id: actorId }).lean();
   const gap = cursor ? (when - new Date(cursor.last_event_at)) : Infinity;
-  const isNewSession = !cursor || gap > SESSION_TIMEOUT_MS || gap < 0;
+  // A small negative gap (event arrived out of order relative to its own
+  // timestamp — normal jitter, not a real return-visit) is tolerated as
+  // still the same session. Only a gap beyond the timeout, in either
+  // direction, actually starts a new session.
+  const isNewSession = !cursor || gap > SESSION_TIMEOUT_MS || gap < -NEGATIVE_GAP_TOLERANCE_MS;
 
   if (isNewSession) {
     return { session_id: crypto.randomUUID(), session_start: when, session_end: null, session_time_spent: null, cursor, isNewSession: true };
@@ -375,10 +409,24 @@ async function commitSessionCursor(brand, actorId, timing, when, docRef, eventDo
     eventsSeq = { ...prevSeq, [nextKey]: eventDoc };
   }
 
+  // Never let a tolerated out-of-order (but still-same-session) event move
+  // the cursor's "latest known event" pointer backward — otherwise a later
+  // event that arrives first, followed by an earlier-timestamped one, would
+  // wrongly become the session's closing event/timestamp.
+  let newLastEventAt = when;
+  let newLastRef = docRef;
+  if (!timing.isNewSession && timing.cursor) {
+    const prevLastEventAt = new Date(timing.cursor.last_event_at);
+    if (prevLastEventAt > when) {
+      newLastEventAt = prevLastEventAt;
+      newLastRef = timing.cursor.last_ref;
+    }
+  }
+
   try {
     await ActorCursor.updateOne(
       { brand_id: brand, actor_id: actorId },
-      { $set: { session_id: timing.session_id, session_start: timing.session_start, last_event_at: when, last_ref: docRef, events_seq: eventsSeq } },
+      { $set: { session_id: timing.session_id, session_start: timing.session_start, last_event_at: newLastEventAt, last_ref: newLastRef, events_seq: eventsSeq } },
       { upsert: true }
     );
   } catch (err) {
@@ -454,40 +502,51 @@ app.post('/collect', brandAuth, async (req, res) => {
 
       const actorId = e.actor_id || e.client_id || null;
       const clickBucket = classifyClick(e.data.signals);
-      const timing = await resolveSessionTiming(req.brand, actorId, when);
 
-      const doc = {
-        brand_id: req.brand,
-        event_id: e.event_id,
-        event_name: e.event_name,
-        occurred_at: when,
-        ingested_at: new Date(),
-        client_id: e.client_id || null,
-        visitor_id: e.visitor_id || null,
-        session_id: timing.session_id,
-        actor_id: actorId,
-        session_start: timing.session_start,
-        session_end: timing.session_end,
-        session_time_spent: timing.session_time_spent,
-        url: e.url || null,
-        referrer: e.referrer || null,
-        user_agent: e.user_agent || null,
-        click: e.data.click,
-        signals: e.data.signals,
-        click_bucket: clickBucket,
-        raw: e
+      const runInsert = async () => {
+        const timing = await resolveSessionTiming(req.brand, actorId, when);
+
+        const doc = {
+          brand_id: req.brand,
+          event_id: e.event_id,
+          event_name: e.event_name,
+          occurred_at: when,
+          ingested_at: new Date(),
+          client_id: e.client_id || null,
+          visitor_id: e.visitor_id || null,
+          session_id: timing.session_id,
+          actor_id: actorId,
+          session_start: timing.session_start,
+          session_end: timing.session_end,
+          session_time_spent: timing.session_time_spent,
+          url: e.url || null,
+          referrer: e.referrer || null,
+          user_agent: e.user_agent || null,
+          click: e.data.click,
+          signals: e.data.signals,
+          click_bucket: clickBucket,
+          raw: e
+        };
+
+        console.log('[click_event_insert]', JSON.stringify(doc, null, 2));
+
+        const result = await ClickEvent.updateOne(
+          { event_id: e.event_id },
+          { $setOnInsert: doc },
+          { upsert: true }
+        );
+
+        if (result.upsertedCount > 0) {
+          await commitSessionCursor(req.brand, actorId, timing, when, { collection: 'click_events', event_id: e.event_id }, doc);
+        }
       };
 
-      console.log('[click_event_insert]', JSON.stringify(doc, null, 2));
-
-      const result = await ClickEvent.updateOne(
-        { event_id: e.event_id },
-        { $setOnInsert: doc },
-        { upsert: true }
-      );
-
-      if (result.upsertedCount > 0) {
-        await commitSessionCursor(req.brand, actorId, timing, when, { collection: 'click_events', event_id: e.event_id }, doc);
+      // Serialize the read-decide-write cycle per actor to avoid races
+      // between near-simultaneous events (see withActorLock above).
+      if (actorId) {
+        await withActorLock(`${req.brand}|${actorId}`, runInsert);
+      } else {
+        await runInsert();
       }
 
       return res.sendStatus(204);
@@ -524,55 +583,66 @@ app.post('/collect', brandAuth, async (req, res) => {
     // a fresh one whenever a new session starts (per SESSION_TIMEOUT) and
     // reuses it while the actor keeps sending events within that window.
     const actorId = e.actor_id || e.client_id || null;
-    const timing = await resolveSessionTiming(req.brand, actorId, when);
-    const sessionId = timing.session_id;
 
-    // If this is a page view and we parsed a slug, consult slug_cache and inject product_id
-    try {
-      if (isPV && e.slug_info) {
-        const cacheId = `${req.brand}:${e.slug_info.type}:${e.slug_info.slug}`;
-        const cacheDoc = await SlugCache.findById(cacheId).lean().catch(() => null);
-        if (cacheDoc && cacheDoc.shopify_id) {
-          e.data = e.data || {};
-          e.data.product_id = normalizeShopifyId(cacheDoc.shopify_id) || e.data.product_id;
+    const runInsert = async () => {
+      const timing = await resolveSessionTiming(req.brand, actorId, when);
+      const sessionId = timing.session_id;
+
+      // If this is a page view and we parsed a slug, consult slug_cache and inject product_id
+      try {
+        if (isPV && e.slug_info) {
+          const cacheId = `${req.brand}:${e.slug_info.type}:${e.slug_info.slug}`;
+          const cacheDoc = await SlugCache.findById(cacheId).lean().catch(() => null);
+          if (cacheDoc && cacheDoc.shopify_id) {
+            e.data = e.data || {};
+            e.data.product_id = normalizeShopifyId(cacheDoc.shopify_id) || e.data.product_id;
+          }
         }
+      } catch {
+        // swallow slug_cache errors, do not affect pipeline
       }
-    } catch {
-      // swallow slug_cache errors, do not affect pipeline
-    }
 
-    // --- ATC write path (requires session + product) ---
-    let productId = normalizeShopifyId(e?.data?.product_id ?? null);
-    // Treat fallback IDs as "not really resolved" and synthesize a deterministic ID instead
-    if (!productId || isFallbackId(productId)) {
-      productId = synthPid(req.brand, sessionId, e);
-    }
+      // --- ATC write path (requires session + product) ---
+      let productId = normalizeShopifyId(e?.data?.product_id ?? null);
+      // Treat fallback IDs as "not really resolved" and synthesize a deterministic ID instead
+      if (!productId || isFallbackId(productId)) {
+        productId = synthPid(req.brand, sessionId, e);
+      }
 
-    let result;
-    let docRefEventId = e.event_id;
-    let insertDoc;
+      let result;
+      let docRefEventId = e.event_id;
+      let insertDoc;
 
-    if (e.event_name === 'product_added_to_cart' && sessionId && productId) {
-      insertDoc = buildInsertDoc(req.brand, e, sessionId, actorId, when, productId, timing);
+      if (e.event_name === 'product_added_to_cart' && sessionId && productId) {
+        insertDoc = buildInsertDoc(req.brand, e, sessionId, actorId, when, productId, timing);
 
-      result = await Event.updateOne(
-        { brand_id: req.brand, session_id: sessionId, event_name: e.event_name, "raw.product_id": productId },
-        { $setOnInsert: insertDoc },
-        { upsert: true }
-      );
+        result = await Event.updateOne(
+          { brand_id: req.brand, session_id: sessionId, event_name: e.event_name, "raw.product_id": productId },
+          { $setOnInsert: insertDoc },
+          { upsert: true }
+        );
+      } else {
+        // generic idempotent event write
+        insertDoc = buildInsertDoc(req.brand, e, sessionId, actorId, when, null, timing);
+
+        result = await Event.updateOne(
+          { event_id: e.event_id },
+          { $setOnInsert: insertDoc },
+          { upsert: true }
+        );
+      }
+
+      if (result.upsertedCount > 0) {
+        await commitSessionCursor(req.brand, actorId, timing, when, { collection: 'events', event_id: docRefEventId }, insertDoc);
+      }
+    };
+
+    // Serialize the read-decide-write cycle per actor to avoid races
+    // between near-simultaneous events (see withActorLock above).
+    if (actorId) {
+      await withActorLock(`${req.brand}|${actorId}`, runInsert);
     } else {
-      // generic idempotent event write
-      insertDoc = buildInsertDoc(req.brand, e, sessionId, actorId, when, null, timing);
-
-      result = await Event.updateOne(
-        { event_id: e.event_id },
-        { $setOnInsert: insertDoc },
-        { upsert: true }
-      );
-    }
-
-    if (result.upsertedCount > 0) {
-      await commitSessionCursor(req.brand, actorId, timing, when, { collection: 'events', event_id: docRefEventId }, insertDoc);
+      await runInsert();
     }
 
     res.sendStatus(204);
