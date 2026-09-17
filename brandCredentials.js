@@ -6,11 +6,13 @@ const {
   PASSWORD_AES_KEY
 } = process.env;
 
-// AES-256-CBC needs exactly 32 raw key bytes. We don't know for certain
-// whether PASSWORD_AES_KEY is base64 or a raw UTF-8 string, so try base64
-// first and fall back to raw UTF-8 if that doesn't yield 32 bytes. The
-// derived length (not the key itself) is logged once at startup so this can
-// be verified against real data instead of silently assumed.
+// AES-256-CBC needs exactly 32 raw key bytes. Tried base64 and raw UTF-8
+// first (neither produced 32 bytes against real data — confirmed via the
+// startup log below, which caused "Invalid key length" on every decrypt).
+// Since the env var is named PASSWORD_AES_KEY (not AES_KEY), it's most
+// likely a passphrase rather than a key — SHA-256 hashing it is the
+// standard way to turn an arbitrary passphrase into a valid 32-byte AES-256
+// key, so that's the fallback here.
 function deriveAesKey(raw) {
   if (!raw) return null;
   try {
@@ -20,7 +22,8 @@ function deriveAesKey(raw) {
     // fall through
   }
   const utf8 = Buffer.from(raw, 'utf8');
-  return utf8;
+  if (utf8.length === 32) return utf8;
+  return crypto.createHash('sha256').update(raw, 'utf8').digest();
 }
 
 const AES_KEY = deriveAesKey(PASSWORD_AES_KEY);
@@ -77,6 +80,12 @@ export async function refreshBrandCredentials() {
         if (doc.access_token && AES_KEY) {
           try {
             accessToken = decryptAes256Cbc(doc.access_token, AES_KEY);
+            // Sanity check only — never logs the actual token. Shopify access
+            // tokens always start with one of these prefixes; if a
+            // successful decrypt doesn't match, the key is probably still
+            // wrong even though decryption didn't throw.
+            const looksValid = /^shp(at|ca|ua|ss)_/.test(accessToken);
+            console.log(`[brandCredentials] decrypted access_token for brand ${brandId}: looks_valid=${looksValid}, length=${accessToken.length}`);
           } catch (err) {
             console.error(`[brandCredentials] failed to decrypt access_token for brand ${brandId}:`, err.message);
           }
